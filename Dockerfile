@@ -8,9 +8,8 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace/AICB
 
 # [Optional] Configure pip and uv to use Aliyun mirror for faster package downloads.
-RUN pip config set global.index-url http://mirrors.aliyun.com/pypi/simple
-RUN pip config set install.trusted-host mirrors.aliyun.com
-ENV UV_DEFAULT_INDEX="https://mirrors.aliyun.com/pypi/simple"
+RUN pip config set global.index-url https://pypi.org/simple
+ENV UV_DEFAULT_INDEX="https://pypi.org/simple"
 
 RUN pip install --no-cache-dir uv
 
@@ -19,8 +18,19 @@ RUN pip install --no-cache-dir uv
 COPY requirements.txt .
 
 # Install Python dependencies using uv.
-RUN UV_TORCH_BACKEND=auto uv pip install -v --system --no-cache-dir --no-build-isolation --break-system-packages -r requirements.txt
+RUN python -m pip install --no-cache-dir \
+    --index-url https://pypi.org/simple \
+    vllm==0.11.0
 
+# 再用 uv 安装 AICB 其余依赖
+RUN uv pip install -v \
+    --system \
+    --no-cache-dir \
+    --no-build-isolation \
+    --break-system-packages \
+    --index-url https://pypi.org/simple \
+    --index-strategy unsafe-best-match \
+    -r requirements.txt
 # Copy the rest of the application source code into the image.
 COPY . .
 

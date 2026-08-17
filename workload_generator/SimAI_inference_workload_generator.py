@@ -4,6 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import workload_generator.mocked_model.MockedModel
 import workload_generator.mocked_model.inference.MockedDeepSeek as MockedDeepSeek
+import workload_generator.mocked_model.inference.MockedDeepSeekV2Lite as MockedDeepSeekV2Lite
 import workload_generator.mocked_model.inference.MockedQwen3Moe as MockedQwen3Moe
 import workload_generator.mocked_model.inference.MockedQwen3Next as MockedQwen3Next
 from workload_generator.mocked_model.MockedModel import InferencePhase
@@ -44,7 +45,9 @@ def _get_aiob_compute_time(compute_cache, forward_or_backward, stage, dowarn=Tru
     if not aiob_enable:
         return default_compute_time
     compute_time_map = compute_cache
-    if stage == "shared_experts" or stage == "dense_mlp":
+    if stage == "shared_experts" and "shared_experts" in compute_time_map:
+        prefix = "shared_experts"
+    elif stage == "shared_experts" or stage == "dense_mlp":
         prefix = "mlp"
     else:
         prefix = stage
@@ -293,7 +296,10 @@ if __name__ == "__main__":
     model_name = args.model_name
     config_file = args.config_file
     
-    if "Qwen3-Moe" in model_name:
+    if "DeepSeek-V2-Lite" in model_name:
+        args = MockedDeepSeekV2Lite.DeepSeekV2LiteParams(config_file, args)
+        model = MockedDeepSeekV2Lite.DeepSeekV2LiteModel(args)
+    elif "Qwen3-Moe" in model_name:
         args = MockedQwen3Moe.Qwen3MoeParams(config_file, args)
         model = MockedQwen3Moe.Qwen3MoeModel(args)
     elif "Qwen3-Next" in model_name:
@@ -314,7 +320,11 @@ if __name__ == "__main__":
     filename = f"{args.model_name}-world_size{args.world_size}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel}-ep{args.expert_model_parallel_size}-bs{args.micro_batch}-seq{args.seq_length}-{phase}"
     
     if args.aiob_enable:
-        if "Qwen3-Moe" in model_name:
+        if "DeepSeek-V2-Lite" in model_name:
+            import workload_generator.mocked_model.inference.AiobDeepSeekV2Lite as AiobDeepSeekV2Lite
+            aiob_model = AiobDeepSeekV2Lite.DeepSeekV2LiteModel(args)
+            aiob_output_filepath = aiob_model()
+        elif "Qwen3-Moe" in model_name:
             import workload_generator.mocked_model.inference.AiobQwen3Moe as AiobQwen3Moe
             aiob_model = AiobQwen3Moe.Qwen3MoeModel(args)
             aiob_output_filepath = aiob_model()

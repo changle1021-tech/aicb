@@ -15,6 +15,7 @@ aiob_enable=false
 aiob_forward_loops=10
 
 dpsk_default_path="$SCRIPT_DIR/inference_configs/deepseek_default.json"
+dpsk_v2_lite_default_path="$SCRIPT_DIR/inference_configs/deepseek_v2_lite_chat.json"
 qwen3_moe_default_path="$SCRIPT_DIR/inference_configs/qwen3_moe_default.json"
 qwen3_next_default_path="$SCRIPT_DIR/inference_configs/qwen3_next_default.json"
 
@@ -27,7 +28,7 @@ Usage: $0 [OPTIONS]
 Options:
   -m, --model-size <SIZE>
       Model size to use.
-      Possible values: {deepseek-671B, qwen3-235B, qwen3-next-80B}.
+      Possible values: {deepseek-671B, deepseek-v2-lite-chat, qwen3-235B, qwen3-next-80B}.
       (Default: $model_size)
 
   -c, --config <FILE>
@@ -130,6 +131,10 @@ case $model_size in
   deepseek-671B)
     model_name=DeepSeek-671B
     config_file_path=${config_file_path:-$dpsk_default_path}
+    ;;
+  deepseek-v2-lite-chat)
+    model_name=DeepSeek-V2-Lite-Chat
+    config_file_path=${config_file_path:-$dpsk_v2_lite_default_path}
     ;;
   qwen3-235B)
     model_name=Qwen3-Moe-235B

@@ -295,6 +295,7 @@ def extract_inference_averages(file_path,args):
     moe_norm_avg_sum = 0.0
     moe_route_avg_sum = 0.0
     moe_expert_sum = 0.0
+    shared_experts_sum = 0.0
 
     section_header_re = re.compile(r"^(\w+):")
     time_gpu_avg_re = re.compile(r"time_gpu_avg:\s+(\d+(\.\d+)?)")
@@ -318,6 +319,8 @@ def extract_inference_averages(file_path,args):
                     attention_gdn_avg_sum += avg_value
                 elif "atten" in current_section:
                     attention_avg_sum += avg_value
+                elif "shared_experts" in current_section:
+                    shared_experts_sum += avg_value
                 elif "mlp" in current_section:
                     mlp_avg_sum += avg_value
                 elif "moe_norm" in current_section:
@@ -335,6 +338,7 @@ def extract_inference_averages(file_path,args):
         "moe_norm": round(moe_norm_avg_sum),
         "moe_route": round(moe_route_avg_sum),
         "moe_expert": round(moe_expert_sum),
+        "shared_experts": round(shared_experts_sum),
     }
     compute_cache = {key: value for key, value in full_cache.items() if value != 0}
 
