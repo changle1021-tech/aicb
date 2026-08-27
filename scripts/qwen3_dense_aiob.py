@@ -152,7 +152,9 @@ class DenseQwen3Profiler:
         weight = torch.ones(self.hidden_size, device=self.device, dtype=self.dtype)
         epsilon = self.config["rms_norm_eps"]
 
-        if self._vllm_ops is not None:
+        if self._vllm_ops is not None and hasattr(
+            self._vllm_ops, "fused_add_rms_norm"
+        ):
             def operation() -> Any:
                 x_work = x.clone()
                 residual_work = residual.clone()
@@ -181,7 +183,7 @@ class DenseQwen3Profiler:
         weight = torch.ones(self.head_dim, device=self.device, dtype=self.dtype)
         epsilon = self.config["rms_norm_eps"]
 
-        if self._vllm_ops is not None:
+        if self._vllm_ops is not None and hasattr(self._vllm_ops, "rms_norm"):
             def operation() -> Any:
                 output = torch.empty_like(x)
                 self._vllm_ops.rms_norm(output, x, weight, epsilon)
@@ -319,7 +321,7 @@ class DenseQwen3Profiler:
             dtype=self.dtype,
         )
 
-        if self._vllm_ops is not None:
+        if self._vllm_ops is not None and hasattr(self._vllm_ops, "silu_and_mul"):
             def operation() -> Any:
                 output = torch.empty(
                     (self.active_tokens, self.local_intermediate_size),
