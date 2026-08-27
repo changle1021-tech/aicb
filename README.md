@@ -349,6 +349,17 @@ sh ./scripts/inference_workload_with_aiob.sh -m qwen3-32B \
   -p prefill -s 4096 -b 1 -w 4 -t 4 -e 1
 ```
 
+Add `-a` to profile dense Qwen3-32B computation kernels on the local CUDA GPU
+before generating the workload. The profiler measures BF16 RMSNorm, QKV and
+output projections, RoPE, scaled-dot-product attention, and the gated MLP. Its
+output is cached in `results/aiob_outputs` and reused by later runs with the
+same phase, batch, sequence length, and parallel configuration.
+
+```bash
+sh ./scripts/inference_workload_with_aiob.sh -m qwen3-32B \
+  -p prefill -s 4096 -b 1 -w 4 -t 4 -e 1 -a -f 10
+```
+
 > For a complete list of all available options and their descriptions, run the script with the `--help` flag.
 
 > Use the [scripts/inference_configs/config_gen.py](scripts/inference_configs/config_gen.py) script to generate execution scripts based on different argument combinations.

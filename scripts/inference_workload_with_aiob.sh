@@ -159,10 +159,6 @@ case $model_size in
       echo "Qwen3-32B is a dense model; --expert_model_parallel_size must be 1." >&2
       exit 2
     fi
-    if [ "$aiob_enable" = true ]; then
-      echo "AIOB profiling is not implemented for dense Qwen3-32B yet." >&2
-      exit 2
-    fi
     moe_enable=false
     ;;
   (*)
@@ -225,7 +221,7 @@ if [ "$aiob_enable" = true ]; then
   set -- "$@" --aiob_enable
 fi
 
-if [ ! -z "$aiob_forward_loops" ] && [ "$model_name" != "Qwen3-32B" ]; then
+if [ ! -z "$aiob_forward_loops" ]; then
   set -- "$@" --aiob_forward_loops "$aiob_forward_loops"
 fi
 
