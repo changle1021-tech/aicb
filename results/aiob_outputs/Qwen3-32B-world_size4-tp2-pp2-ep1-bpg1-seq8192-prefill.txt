@@ -1,0 +1,40 @@
+inference_term:prefill
+device: NVIDIA H100 80GB HBM3
+dtype: bfloat16
+profile_loops: 10
+atten_norm:
+    time_gpu_max: 238.8480007648468
+    time_gpu_min: 233.18399488925934
+    time_gpu_avg: 235.87839752435684
+atten_qkv:
+    time_gpu_max: 725.055992603302
+    time_gpu_min: 696.256011724472
+    time_gpu_avg: 700.0511983409524
+atten_rotary_emb:
+    time_gpu_max: 119.00799721479416
+    time_gpu_min: 103.4879982471466
+    time_gpu_avg: 105.44640049338341
+atten_flash:
+    time_gpu_max: 1740.6400442123413
+    time_gpu_min: 1680.9600591659546
+    time_gpu_avg: 1716.64320230484
+atten_o:
+    time_gpu_max: 399.07199144363403
+    time_gpu_min: 388.19199800491333
+    time_gpu_avg: 390.04799723625183
+mlp_norm:
+    time_gpu_max: 239.00799453258514
+    time_gpu_min: 233.69599878787994
+    time_gpu_avg: 235.4304000735283
+mlp_gate_up:
+    time_gpu_max: 2334.752082824707
+    time_gpu_min: 2320.3840255737305
+    time_gpu_avg: 2322.422409057617
+mlp_act:
+    time_gpu_max: 680.0959706306458
+    time_gpu_min: 670.3680157661438
+    time_gpu_avg: 672.6623952388763
+mlp_down:
+    time_gpu_max: 1190.0160312652588
+    time_gpu_min: 1176.8640279769897
+    time_gpu_avg: 1178.6144137382507
