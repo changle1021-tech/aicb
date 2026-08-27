@@ -339,6 +339,16 @@ sh ./scripts/inference_workload_with_aiob.sh -m qwen3-235B \
 -s 1024 -b 4 -w 32 -e 32 -p prefill
 ```
 
+- Generating a dense Qwen3-32B workload. Dense Qwen3 has no expert-parallel
+  traffic, so `ep` must be 1. With TP enabled, every transformer layer emits
+  one AllReduce for attention and one for the MLP. Prefill communication sizes
+  account for every prompt token in the micro batch.
+
+```bash
+sh ./scripts/inference_workload_with_aiob.sh -m qwen3-32B \
+  -p prefill -s 4096 -b 1 -w 4 -t 4 -e 1
+```
+
 > For a complete list of all available options and their descriptions, run the script with the `--help` flag.
 
 > Use the [scripts/inference_configs/config_gen.py](scripts/inference_configs/config_gen.py) script to generate execution scripts based on different argument combinations.

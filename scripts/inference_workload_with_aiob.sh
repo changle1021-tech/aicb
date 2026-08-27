@@ -7,7 +7,7 @@ seq_length=1024
 micro_batch=32
 world_size=8
 tensor_model_parallel_size=1
-expert_model_parallel_size=8
+expert_model_parallel_size=
 pipeline_model_parallel=1
 moe_enable=true
 result_dir=results/workload/
@@ -18,6 +18,7 @@ dpsk_default_path="$SCRIPT_DIR/inference_configs/deepseek_default.json"
 dpsk_v2_lite_default_path="$SCRIPT_DIR/inference_configs/deepseek_v2_lite_chat.json"
 qwen3_moe_default_path="$SCRIPT_DIR/inference_configs/qwen3_moe_default.json"
 qwen3_next_default_path="$SCRIPT_DIR/inference_configs/qwen3_next_default.json"
+qwen3_32b_default_path="$SCRIPT_DIR/inference_configs/qwen3_32b.json"
 
 usage() {
   cat <<-EOF
@@ -28,7 +29,8 @@ Usage: $0 [OPTIONS]
 Options:
   -m, --model-size <SIZE>
       Model size to use.
-      Possible values: {deepseek-671B, deepseek-v2-lite-chat, qwen3-235B, qwen3-next-80B}.
+      Possible values: {deepseek-671B, deepseek-v2-lite-chat, qwen3-235B,
+                        qwen3-next-80B, qwen3-32B}.
       (Default: $model_size)
 
   -c, --config <FILE>
@@ -58,7 +60,7 @@ Options:
 
   -e, --ep-size <SIZE>
       Expert model parallel size (for MoE models).
-      (Default: $expert_model_parallel_size)
+      (Default: 8 for MoE models; 1 for dense Qwen3-32B)
 
   -l, --pp-size <SIZE>
       Pipeline model parallel size.
@@ -87,42 +89,43 @@ Example:
   sh $0 -m deepseek-671B -p decode -s 1024 -b 32 --aiob-enable
 
 EOF
-  exit 1
+  exit "${1:-1}"
 }
 
 while [ $# -gt 0 ]
 do
   case $1 in
-    -m|--model_size)
+    -m|--model_size|--model-size)
       model_size=$2; shift;;
     -c|--config)
       config_file_path=$2; shift;;
     -p|--phase)
       phase=$2; shift;;
-    -s|--seq_length)
+    -s|--seq_length|--seq-length)
       seq_length=$2; shift;;
-    -b|--micro_batch)
+    -b|--micro_batch|--micro-batch)
       micro_batch=$2; shift;;
-    -w|--world_size)
+    -w|--world_size|--world-size)
       world_size=$2; shift;;
-    -t|--tensor_model_parallel_size)
+    -t|--tensor_model_parallel_size|--tp-size)
       tensor_model_parallel_size=$2; shift;;
-    -e|--expert_model_parallel_size)
+    -e|--expert_model_parallel_size|--ep-size)
       expert_model_parallel_size=$2; shift;;
-    -l|--pipeline_model_parallel)
+    -l|--pipeline_model_parallel|--pp-size)
       pipeline_model_parallel=$2; shift;;
-    -M|--moe_enable)
+    -M|--moe_enable|--moe-enable)
       moe_enable=true;;
-    -r|--result_dir)
+    -r|--result_dir|--result-dir)
       result_dir=$2; shift;;
-    -a|--aiob_enable)
+    -a|--aiob_enable|--aiob-enable)
       aiob_enable=true;;
-    -f|--aiob_forward_loops)
+    -f|--aiob_forward_loops|--aiob-loops)
       aiob_forward_loops=$2; shift;;
     -h|--help)
-      usage;;
+      usage 0;;
     (*)
-      break;;
+      echo "Unknown option: $1" >&2
+      usage;;
   esac
   shift
 done
@@ -131,72 +134,102 @@ case $model_size in
   deepseek-671B)
     model_name=DeepSeek-671B
     config_file_path=${config_file_path:-$dpsk_default_path}
+    expert_model_parallel_size=${expert_model_parallel_size:-8}
     ;;
   deepseek-v2-lite-chat)
     model_name=DeepSeek-V2-Lite-Chat
     config_file_path=${config_file_path:-$dpsk_v2_lite_default_path}
+    expert_model_parallel_size=${expert_model_parallel_size:-8}
     ;;
   qwen3-235B)
     model_name=Qwen3-Moe-235B
     config_file_path=${config_file_path:-$qwen3_moe_default_path}
+    expert_model_parallel_size=${expert_model_parallel_size:-8}
     ;;
   qwen3-next-80B)
     model_name=Qwen3-Next-80B
     config_file_path=${config_file_path:-$qwen3_next_default_path}
+    expert_model_parallel_size=${expert_model_parallel_size:-8}
+    ;;
+  qwen3-32B|qwen-32B|qwen32B)
+    model_name=Qwen3-32B
+    config_file_path=${config_file_path:-$qwen3_32b_default_path}
+    expert_model_parallel_size=${expert_model_parallel_size:-1}
+    if [ "$expert_model_parallel_size" != "1" ]; then
+      echo "Qwen3-32B is a dense model; --expert_model_parallel_size must be 1." >&2
+      exit 2
+    fi
+    if [ "$aiob_enable" = true ]; then
+      echo "AIOB profiling is not implemented for dense Qwen3-32B yet." >&2
+      exit 2
+    fi
+    moe_enable=false
     ;;
   (*)
     echo "Invalid model size: $model_size"
     usage;;
 esac
 
-# Build command with optional parameters
-cmd="python -m workload_generator.SimAI_inference_workload_generator $model_name $config_file_path"
+# Build command with optional parameters. Positional arguments preserve spaces
+# in paths and avoid evaluating shell metacharacters.
+if command -v python3 >/dev/null 2>&1; then
+  python_bin=python3
+else
+  python_bin=python
+fi
+
+if [ "$model_name" = "Qwen3-32B" ]; then
+  set -- "$python_bin" "$SCRIPT_DIR/qwen3_dense_workload_generator.py" "$model_name" "$config_file_path"
+else
+  set -- "$python_bin" -m workload_generator.SimAI_inference_workload_generator "$model_name" "$config_file_path"
+fi
 
 # Add optional parameters if they are set
 if [ ! -z "$phase" ]; then
-  cmd="$cmd --phase $phase"
+  set -- "$@" --phase "$phase"
 fi
 
 if [ ! -z "$seq_length" ]; then
-  cmd="$cmd --seq_length $seq_length"
+  set -- "$@" --seq_length "$seq_length"
 fi
 
 if [ ! -z "$micro_batch" ]; then
-  cmd="$cmd --micro_batch $micro_batch"
+  set -- "$@" --micro_batch "$micro_batch"
 fi
 
 if [ ! -z "$world_size" ]; then
-  cmd="$cmd --world_size $world_size"
+  set -- "$@" --world_size "$world_size"
 fi
 
 if [ ! -z "$tensor_model_parallel_size" ]; then
-  cmd="$cmd --tensor_model_parallel_size $tensor_model_parallel_size"
+  set -- "$@" --tensor_model_parallel_size "$tensor_model_parallel_size"
 fi
 
-if [ ! -z "$expert_model_parallel_size" ]; then
-  cmd="$cmd --expert_model_parallel_size $expert_model_parallel_size"
+if [ ! -z "$expert_model_parallel_size" ] && [ "$model_name" != "Qwen3-32B" ]; then
+  set -- "$@" --expert_model_parallel_size "$expert_model_parallel_size"
 fi
 
 if [ ! -z "$pipeline_model_parallel" ]; then
-  cmd="$cmd --pipeline_model_parallel $pipeline_model_parallel"
+  set -- "$@" --pipeline_model_parallel "$pipeline_model_parallel"
 fi
 
 if [ "$moe_enable" = true ]; then
-  cmd="$cmd --moe_enable"
+  set -- "$@" --moe_enable
 fi
 
 if [ ! -z "$result_dir" ]; then
-  cmd="$cmd --result_dir $result_dir"
+  set -- "$@" --result_dir "$result_dir"
 fi
 
 if [ "$aiob_enable" = true ]; then
-  cmd="$cmd --aiob_enable"
+  set -- "$@" --aiob_enable
 fi
 
-if [ ! -z "$aiob_forward_loops" ]; then
-  cmd="$cmd --aiob_forward_loops $aiob_forward_loops"
+if [ ! -z "$aiob_forward_loops" ] && [ "$model_name" != "Qwen3-32B" ]; then
+  set -- "$@" --aiob_forward_loops "$aiob_forward_loops"
 fi
 
-echo $cmd
-
-$cmd
+printf 'Running:'
+printf ' %s' "$@"
+printf '\n'
+"$@"
