@@ -1,61 +1,61 @@
 inference_term:decode
 atten_norm:
-    time_gpu_max: 2.682
-    time_gpu_min: 2.207
-    time_gpu_avg: 2.5817
+    time_gpu_max: 2.693
+    time_gpu_min: 2.226
+    time_gpu_avg: 2.6122
 atten_qkv:
-    time_gpu_max: 10.923
-    time_gpu_min: 10.312000000000001
-    time_gpu_avg: 10.546800000000001
+    time_gpu_max: 11.321
+    time_gpu_min: 10.665999999999999
+    time_gpu_avg: 10.9331
 atten_rotary_emb:
-    time_gpu_max: 3.202
-    time_gpu_min: 3.007
-    time_gpu_avg: 3.0993
+    time_gpu_max: 3.2279999999999998
+    time_gpu_min: 3.122
+    time_gpu_avg: 3.1582
 atten_flash:
-    time_gpu_max: 9.82
-    time_gpu_min: 9.674
-    time_gpu_avg: 9.7312
+    time_gpu_max: 9.912
+    time_gpu_min: 9.695
+    time_gpu_avg: 9.7813
 atten_o:
-    time_gpu_max: 6.322
-    time_gpu_min: 6.175
-    time_gpu_avg: 6.2503
+    time_gpu_max: 6.392
+    time_gpu_min: 6.269999999999999
+    time_gpu_avg: 6.3431
 gdn_qkv:
-    time_gpu_max: 8.163999999999998
-    time_gpu_min: 8.038
-    time_gpu_avg: 8.0991
+    time_gpu_max: 8.193
+    time_gpu_min: 8.000000000000002
+    time_gpu_avg: 8.108
 gdn_causal_conv:
-    time_gpu_max: 1.938
-    time_gpu_min: 1.902
-    time_gpu_avg: 1.9241
+    time_gpu_max: 1.9609999999999999
+    time_gpu_min: 1.834
+    time_gpu_avg: 1.8960000000000001
 gdn_core:
-    time_gpu_max: 6.469
-    time_gpu_min: 6.315999999999999
-    time_gpu_avg: 6.3902
+    time_gpu_max: 6.465000000000001
+    time_gpu_min: 6.296
+    time_gpu_avg: 6.364800000000001
 gdn_o:
-    time_gpu_max: 5.005000000000001
-    time_gpu_min: 4.817
-    time_gpu_avg: 4.9002
+    time_gpu_max: 4.913999999999999
+    time_gpu_min: 4.819
+    time_gpu_avg: 4.8842
 moe_norm:
-    time_gpu_max: 2.686
-    time_gpu_min: 2.554
-    time_gpu_avg: 2.6147
+    time_gpu_max: 2.685
+    time_gpu_min: 2.622
+    time_gpu_avg: 2.6496
 moe_route_gate:
     time_gpu_max: 0.0
     time_gpu_min: 0.0
     time_gpu_avg: 0.0
 moe_route_select_experts:
-    time_gpu_max: 4.848
-    time_gpu_min: 4.784
-    time_gpu_avg: 4.812
+    time_gpu_max: 4.867
+    time_gpu_min: 4.833
+    time_gpu_avg: 4.8449
 moe_expert_up:
-    time_gpu_max: 126.96199999999999
-    time_gpu_min: 125.788
-    time_gpu_avg: 126.28980000000001
+    time_gpu_max: 126.403
+    time_gpu_min: 125.29500000000002
+    time_gpu_avg: 125.95909999999999
 moe_expert_act:
     time_gpu_max: 0.0
     time_gpu_min: 0.0
     time_gpu_avg: 0.0
 moe_expert_down:
-    time_gpu_max: 67.422
-    time_gpu_min: 66.481
-    time_gpu_avg: 67.0787
+    time_gpu_max: 67.384
+    time_gpu_min: 66.705
+    time_gpu_avg: 66.99539999999999
