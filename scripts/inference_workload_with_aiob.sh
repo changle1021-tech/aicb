@@ -229,3 +229,12 @@ printf 'Running:'
 printf ' %s' "$@"
 printf '\n'
 "$@"
+
+# A one-rank expert-parallel group cannot produce inter-rank traffic. Keep the
+# MoE compute stages, but normalize their EP collectives to no-ops.
+if [ "$expert_model_parallel_size" = "1" ] && [ "$moe_enable" = true ]; then
+  workload_file="$result_dir/${model_name}-world_size${world_size}-tp${tensor_model_parallel_size}-pp${pipeline_model_parallel}-ep${expert_model_parallel_size}-bs${micro_batch}-seq${seq_length}-${phase}.txt"
+  if [ -f "$workload_file" ]; then
+    "$python_bin" "$SCRIPT_DIR/normalize_ep1_workload.py" "$workload_file"
+  fi
+fi
