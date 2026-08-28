@@ -28,7 +28,9 @@ def _load_torch():
     if not torch.cuda.is_available():
         raise ProfilingError("AIOB profiling requires a CUDA-capable GPU")
     if not torch.cuda.is_bf16_supported():
-        raise ProfilingError("Qwen3-32B AIOB profiling requires BF16-capable CUDA hardware")
+        raise ProfilingError(
+            "Qwen3-32B AIOB profiling requires BF16-capable CUDA hardware"
+        )
     return torch, functional
 
 
@@ -52,6 +54,54 @@ def _benchmark(
         torch.cuda.synchronize()
     # CUDA events report milliseconds; AIOB inference profiles use microseconds.
     return [start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)]
+
+
+def _benchmark_cuda_kernels(
+    torch: Any,
+    operation: Callable[[], Any],
+    loops: int,
+    warmup_loops: int,
+) -> list[float]:
+    """Return pure CUDA kernel time for a steady-state decode operation.
+
+    This follows the Kineto-based measurement used by AIOB's other inference
+    profilers: CPU dispatch gaps, CUDA event commands, and tensor allocation on
+    the host are excluded; all CUDA kernels launched by one logical operation
+    are included.
+    """
+    with torch.inference_mode():
+        for _ in range(max(warmup_loops, 10)):
+            operation()
+        torch.cuda.synchronize()
+
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        with torch.profiler.profile(activities=activities) as profiler:
+            for _ in range(loops):
+                operation()
+        torch.cuda.synchronize()
+
+    cuda_time = 0.0
+    cuda_event_count = 0
+    for event in profiler.events():
+        device_type = getattr(event, "device_type", None)
+        device_name = getattr(device_type, "name", str(device_type)).upper()
+        if "CUDA" not in device_name:
+            continue
+        cuda_time += float(event.time_range.elapsed_us())
+        cuda_event_count += 1
+
+    if cuda_event_count == 0:
+        raise ProfilingError(
+            "Kineto did not report any CUDA kernels for a decode operation"
+        )
+
+    average = cuda_time / loops
+    # Preserve the profile schema (min/max/avg over `loops` samples). Kineto
+    # reports aggregate kernel events, so every logical sample uses that mean.
+    return [average] * loops
 
 
 def _filtered_stats(samples: list[float]) -> dict[str, float]:
@@ -106,10 +156,14 @@ class DenseQwen3Profiler:
                 "intermediate_size must be divisible by tensor parallel size"
             )
         if self.query_heads % self.kv_heads:
-            raise ProfilingError("local query heads must be divisible by local KV heads")
+            raise ProfilingError(
+                "local query heads must be divisible by local KV heads"
+            )
 
         self._vllm_ops = None
         self._vllm_get_rope = None
+        self._decode_silu_and_mul = None
+        self._flashinfer = None
         try:
             from vllm import _custom_ops as vllm_ops
             from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -121,54 +175,104 @@ class DenseQwen3Profiler:
             # fallback when vLLM custom operations are unavailable.
             pass
 
+        if self.phase == "decode":
+            if self._vllm_ops is not None and hasattr(
+                self._vllm_ops, "silu_and_mul"
+            ):
+                self._decode_silu_and_mul = self._vllm_ops.silu_and_mul
+            else:
+                torch_c_ops = getattr(self.torch.ops, "_C", None)
+                if torch_c_ops is not None and hasattr(torch_c_ops, "silu_and_mul"):
+                    self._decode_silu_and_mul = torch_c_ops.silu_and_mul
+
+            if self._decode_silu_and_mul is None:
+                raise ProfilingError(
+                    "Qwen3 decode profiling requires vLLM's fused "
+                    "silu_and_mul operator; verify that the installed vLLM "
+                    "extension matches the current PyTorch/CUDA environment"
+                )
+
+            try:
+                import flashinfer
+            except (ImportError, OSError) as error:
+                raise ProfilingError(
+                    "Qwen3 decode profiling requires FlashInfer paged attention; "
+                    "install the FlashInfer version required by vLLM"
+                ) from error
+            self._flashinfer = flashinfer
+
+    def _benchmark_operation(self, operation: Callable[[], Any]) -> list[float]:
+        if self.phase == "decode":
+            return _benchmark_cuda_kernels(
+                self.torch,
+                operation,
+                self.loops,
+                self.warmup_loops,
+            )
+        return _benchmark(
+            self.torch, operation, self.loops, self.warmup_loops
+        )
+
     def _release(self) -> None:
+        # Decode components are intentionally profiled in a warm allocator/cache
+        # state, matching a steady-state token loop.  Prefill retains the legacy
+        # isolation behavior so existing prefill profiles do not change.
+        if self.phase == "decode":
+            return
         gc.collect()
         self.torch.cuda.empty_cache()
 
-    def _measure_linear(self, rows: int, input_size: int, output_size: int) -> list[float]:
+    def _measure_linear(
+        self, rows: int, input_size: int, output_size: int
+    ) -> list[float]:
         torch = self.torch
         x = torch.empty((rows, input_size), device=self.device, dtype=self.dtype)
         weight = torch.empty(
             (output_size, input_size), device=self.device, dtype=self.dtype
         )
-        result = _benchmark(
-            torch,
-            lambda: self.functional.linear(x, weight),
-            self.loops,
-            self.warmup_loops,
-        )
+        result = self._benchmark_operation(lambda: self.functional.linear(x, weight))
         del x, weight
         self._release()
         return result
 
     def _measure_residual_rms_norm(self) -> list[float]:
         torch = self.torch
-        x = torch.empty(
+        tensor_factory = torch.zeros if self.phase == "decode" else torch.empty
+        x = tensor_factory(
             (self.active_tokens, self.hidden_size),
             device=self.device,
             dtype=self.dtype,
         )
-        residual = torch.empty_like(x)
+        residual = (
+            torch.zeros_like(x) if self.phase == "decode" else torch.empty_like(x)
+        )
         weight = torch.ones(self.hidden_size, device=self.device, dtype=self.dtype)
         epsilon = self.config["rms_norm_eps"]
 
         if self._vllm_ops is not None and hasattr(
             self._vllm_ops, "fused_add_rms_norm"
         ):
-            def operation() -> Any:
-                x_work = x.clone()
-                residual_work = residual.clone()
-                self._vllm_ops.fused_add_rms_norm(
-                    x_work, residual_work, weight, epsilon
-                )
-                return x_work
+            if self.phase == "decode":
+                def operation() -> Any:
+                    self._vllm_ops.fused_add_rms_norm(
+                        x, residual, weight, epsilon
+                    )
+                    return x
+            else:
+                def operation() -> Any:
+                    x_work = x.clone()
+                    residual_work = residual.clone()
+                    self._vllm_ops.fused_add_rms_norm(
+                        x_work, residual_work, weight, epsilon
+                    )
+                    return x_work
         else:
             def operation() -> Any:
                 return self.functional.rms_norm(
                     x + residual, (self.hidden_size,), weight, epsilon
                 )
 
-        result = _benchmark(torch, operation, self.loops, self.warmup_loops)
+        result = self._benchmark_operation(operation)
         del x, residual, weight
         self._release()
         return result
@@ -184,15 +288,22 @@ class DenseQwen3Profiler:
         epsilon = self.config["rms_norm_eps"]
 
         if self._vllm_ops is not None and hasattr(self._vllm_ops, "rms_norm"):
-            def operation() -> Any:
+            if self.phase == "decode":
                 output = torch.empty_like(x)
-                self._vllm_ops.rms_norm(output, x, weight, epsilon)
-                return output
+
+                def operation() -> Any:
+                    self._vllm_ops.rms_norm(output, x, weight, epsilon)
+                    return output
+            else:
+                def operation() -> Any:
+                    output = torch.empty_like(x)
+                    self._vllm_ops.rms_norm(output, x, weight, epsilon)
+                    return output
         else:
             def operation() -> Any:
                 return self.functional.rms_norm(x, (self.head_dim,), weight, epsilon)
 
-        result = _benchmark(torch, operation, self.loops, self.warmup_loops)
+        result = self._benchmark_operation(operation)
         del x, weight
         self._release()
         return result
@@ -236,7 +347,7 @@ class DenseQwen3Profiler:
                     k.view(self.active_tokens, -1),
                 )
 
-            result = _benchmark(torch, operation, self.loops, self.warmup_loops)
+            result = self._benchmark_operation(operation)
             del q, k, positions, rotary_embedding
             self._release()
             return result
@@ -264,52 +375,111 @@ class DenseQwen3Profiler:
                 k * cosine_full + rotate(k) * sine_full,
             )
 
-        result = _benchmark(torch, operation, self.loops, self.warmup_loops)
+        result = self._benchmark_operation(operation)
         del q, k, positions, inv_freq, frequencies, cosine, sine
         self._release()
         return result
 
     def _measure_attention(self) -> list[float]:
         torch = self.torch
-        if self.phase == "prefill":
-            query_length = self.seq_length
-            q = torch.empty(
-                (self.micro_batch, self.query_heads, query_length, self.head_dim),
-                device=self.device,
-                dtype=self.dtype,
-            )
-            k = torch.empty(
-                (self.micro_batch, self.kv_heads, query_length, self.head_dim),
-                device=self.device,
-                dtype=self.dtype,
-            )
-            v = torch.empty_like(k)
-            is_causal = True
-        else:
-            q = torch.empty(
-                (self.micro_batch, self.query_heads, 1, self.head_dim),
-                device=self.device,
-                dtype=self.dtype,
-            )
-            k = torch.empty(
-                (self.micro_batch, self.kv_heads, self.seq_length, self.head_dim),
-                device=self.device,
-                dtype=self.dtype,
-            )
-            v = torch.empty_like(k)
-            is_causal = False
+        if self.phase == "decode":
+            return self._measure_decode_attention()
+
+        query_length = self.seq_length
+        q = torch.empty(
+            (self.micro_batch, self.query_heads, query_length, self.head_dim),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        k = torch.empty(
+            (self.micro_batch, self.kv_heads, query_length, self.head_dim),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        v = torch.empty_like(k)
 
         def operation() -> Any:
             return self.functional.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                is_causal=is_causal,
+                is_causal=True,
                 enable_gqa=self.query_heads != self.kv_heads,
             )
 
-        result = _benchmark(torch, operation, self.loops, self.warmup_loops)
+        result = self._benchmark_operation(operation)
         del q, k, v
+        self._release()
+        return result
+
+    def _measure_decode_attention(self) -> list[float]:
+        """Profile vLLM-style decode attention over a paged KV cache."""
+        torch = self.torch
+        block_size = 32
+        blocks_per_sequence = (self.seq_length + block_size - 1) // block_size
+        total_blocks = self.micro_batch * blocks_per_sequence
+
+        query = torch.empty(
+            (self.micro_batch, self.query_heads, self.head_dim),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        key_value_cache = torch.empty(
+            (total_blocks, 2, block_size, self.kv_heads, self.head_dim),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        kv_indptr = torch.arange(
+            0,
+            total_blocks + 1,
+            blocks_per_sequence,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        kv_indices = torch.arange(
+            total_blocks, device=self.device, dtype=torch.int32
+        )
+        last_page_length = self.seq_length % block_size or block_size
+        kv_last_page_lens = torch.full(
+            (self.micro_batch,),
+            last_page_length,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        workspace_buffer = torch.zeros(
+            128 * 1024 * 1024, device=self.device, dtype=torch.uint8
+        )
+        wrapper = self._flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer,
+            "NHD",
+            use_tensor_cores=(self.query_heads // self.kv_heads) > 4,
+        )
+        wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            self.query_heads,
+            self.kv_heads,
+            self.head_dim,
+            block_size,
+            pos_encoding_mode="NONE",
+            q_data_type=self.dtype,
+            kv_data_type=self.dtype,
+            logits_soft_cap=None,
+        )
+
+        result = self._benchmark_operation(
+            lambda: wrapper.run(query, key_value_cache)
+        )
+        del (
+            query,
+            key_value_cache,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            workspace_buffer,
+            wrapper,
+        )
         self._release()
         return result
 
@@ -321,7 +491,19 @@ class DenseQwen3Profiler:
             dtype=self.dtype,
         )
 
-        if self._vllm_ops is not None and hasattr(self._vllm_ops, "silu_and_mul"):
+        if self.phase == "decode":
+            output = torch.empty(
+                (self.active_tokens, self.local_intermediate_size),
+                device=self.device,
+                dtype=self.dtype,
+            )
+
+            def operation() -> Any:
+                self._decode_silu_and_mul(output, gate_up)
+                return output
+        elif self._vllm_ops is not None and hasattr(
+            self._vllm_ops, "silu_and_mul"
+        ):
             def operation() -> Any:
                 output = torch.empty(
                     (self.active_tokens, self.local_intermediate_size),
@@ -335,7 +517,7 @@ class DenseQwen3Profiler:
                 gate, up = gate_up.chunk(2, dim=-1)
                 return self.functional.silu(gate) * up
 
-        result = _benchmark(torch, operation, self.loops, self.warmup_loops)
+        result = self._benchmark_operation(operation)
         del gate_up
         self._release()
         return result
@@ -414,6 +596,12 @@ def profile_dense_qwen3(
         output.write(f"device: {device_name}\n")
         output.write(f"dtype: bfloat16\n")
         output.write(f"profile_loops: {loops}\n")
+        if phase == "decode":
+            output.write("timing_mode: kineto_cuda_kernels\n")
+            output.write("attention_backend: flashinfer_paged_kv\n")
+        else:
+            output.write("timing_mode: per_iteration_cuda_events\n")
+            output.write("attention_backend: torch_sdpa\n")
         for section, section_samples in samples.items():
             output.write(f"{section}:\n")
             for name, value in _filtered_stats(section_samples).items():
