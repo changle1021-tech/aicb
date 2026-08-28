@@ -1,5 +1,8 @@
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
+# Adding another inference model? Follow the integration and profiling checklist
+# in scripts/inference_configs/README.md before registering it below.
+
 model_size=deepseek-671B
 config_file_path=
 phase=decode

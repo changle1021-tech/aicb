@@ -2,4 +2,4 @@
 *local*
 .ipynb_checkpoints
 .pytest_cache
-
+*:Zone.Identifier

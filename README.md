@@ -315,7 +315,10 @@ sh ./scripts/workload_deepspeed.sh -m 7
 
 ## Generate Workloads for Inference Simulation (SimAI)
 
-Use the [scripts/inference_workload_with_aiob.sh](scripts/inference_workload_with_aiob.sh) script to generate workload description files for **DeepSeek**, **Qwen3-MoE**, and **Qwen3-Next**. Configuration is managed through a combination of a model-specific JSON file and command-line arguments. The JSON file defines the core model architecture (e.g., number of layers, hidden size), while command-line arguments are used to specify runtime parameters such as sequence length, batch size, and parallelism settings.
+Use the [scripts/inference_workload_with_aiob.sh](scripts/inference_workload_with_aiob.sh) script to generate workload description files for **DeepSeek**, **Qwen3-MoE**, **Qwen3-Next**, and dense **Qwen3-32B**. Configuration is managed through a combination of a model-specific JSON file and command-line arguments. The JSON file defines the core model architecture (e.g., number of layers, hidden size), while command-line arguments are used to specify runtime parameters such as sequence length, batch size, and parallelism settings.
+
+Contributors adding another inference model should follow the
+[model integration and profiling checklist](scripts/inference_configs/README.md).
 
 > **Note:**
 > 
