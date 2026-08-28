@@ -82,6 +82,10 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def validate_topology(args: argparse.Namespace, config: dict[str, Any]) -> None:
+    if args.expert_model_parallel_size != 1:
+        raise ValueError(
+            "dense Qwen3 requires expert_model_parallel_size to be 1"
+        )
     model_parallel_size = args.tensor_model_parallel_size * args.pipeline_model_parallel
     if args.world_size % model_parallel_size:
         raise ValueError(
@@ -202,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--micro_batch", type=positive_int, default=1)
     parser.add_argument("--world_size", type=positive_int, default=1)
     parser.add_argument("--tensor_model_parallel_size", type=positive_int, default=1)
+    parser.add_argument("--expert_model_parallel_size", type=positive_int, default=1)
     parser.add_argument("--pipeline_model_parallel", type=positive_int, default=1)
     parser.add_argument("--result_dir", type=Path, default=Path("results/workload"))
     parser.add_argument("--aiob_enable", action="store_true")

@@ -1,5 +1,15 @@
 import sys
 import os
+
+# Dense Qwen3 has its own generator because the generic model below assumes
+# MoE-style routing state. Dispatch it before importing the generic generator's
+# optional dependencies so the public ``python -m`` entry point supports it too.
+if __name__ == "__main__" and "Qwen3-32B" in sys.argv[1:]:
+    from scripts.qwen3_dense_workload_generator import main as dense_qwen3_main
+
+    dense_qwen3_main()
+    raise SystemExit(0)
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import workload_generator.mocked_model.MockedModel
@@ -272,7 +282,7 @@ if __name__ == "__main__":
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Generate inference workload for AI models")
-    parser.add_argument("model_name", help="Model name (e.g., DeepSeek-671B, Qwen3-Moe-235B, Qwen3-Next-80B)")
+    parser.add_argument("model_name", help="Model name (e.g., DeepSeek-671B, Qwen3-Moe-235B, Qwen3-Next-80B, Qwen3-32B)")
     parser.add_argument("config_file", nargs="?", help="Path to JSON config file")
 
     # Add arguments that has default value
