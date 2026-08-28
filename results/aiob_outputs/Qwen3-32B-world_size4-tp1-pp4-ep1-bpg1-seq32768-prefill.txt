@@ -2,39 +2,41 @@ inference_term:prefill
 device: NVIDIA H100 80GB HBM3
 dtype: bfloat16
 profile_loops: 10
+timing_mode: per_iteration_cuda_events
+attention_backend: torch_sdpa
 atten_norm:
-    time_gpu_max: 903.007984161377
-    time_gpu_min: 897.599995136261
-    time_gpu_avg: 898.988801240921
+    time_gpu_max: 902.4320244789124
+    time_gpu_min: 896.992027759552
+    time_gpu_avg: 899.0944027900696
 atten_qkv:
-    time_gpu_max: 5785.375788807869
-    time_gpu_min: 5339.232072234154
-    time_gpu_avg: 5553.686347603798
+    time_gpu_max: 5718.623802065849
+    time_gpu_min: 5374.943897128105
+    time_gpu_avg: 5441.775953769684
 atten_rotary_emb:
-    time_gpu_max: 789.5359992980957
-    time_gpu_min: 772.0959782600403
-    time_gpu_avg: 775.0655949115753
+    time_gpu_max: 786.4000201225281
+    time_gpu_min: 773.1519937515259
+    time_gpu_avg: 775.2192080020905
 atten_flash:
-    time_gpu_max: 46824.127197265625
-    time_gpu_min: 46169.822692871094
-    time_gpu_avg: 46325.314712524414
+    time_gpu_max: 47034.881591796875
+    time_gpu_min: 46209.18273925781
+    time_gpu_avg: 46372.45788574219
 atten_o:
-    time_gpu_max: 3197.5998878479004
-    time_gpu_min: 3068.063974380493
-    time_gpu_avg: 3144.9631929397583
+    time_gpu_max: 3185.4400634765625
+    time_gpu_min: 3061.7918968200684
+    time_gpu_avg: 3132.931160926819
 mlp_norm:
-    time_gpu_max: 903.3600091934204
-    time_gpu_min: 896.4160084724426
-    time_gpu_avg: 898.5632002353668
+    time_gpu_max: 901.6320109367371
+    time_gpu_min: 896.8960046768188
+    time_gpu_avg: 898.4768033027649
 mlp_gate_up:
-    time_gpu_max: 21402.015686035156
-    time_gpu_min: 21150.07972717285
-    time_gpu_avg: 21300.003242492676
+    time_gpu_max: 21396.799087524414
+    time_gpu_min: 21225.59928894043
+    time_gpu_avg: 21328.04126739502
 mlp_act:
-    time_gpu_max: 5295.936107635498
-    time_gpu_min: 5179.07190322876
-    time_gpu_avg: 5261.068820953369
+    time_gpu_max: 5261.407852172852
+    time_gpu_min: 5254.655838012695
+    time_gpu_avg: 5256.473588943481
 mlp_down:
-    time_gpu_max: 13914.463996887207
-    time_gpu_min: 9613.504409790039
-    time_gpu_avg: 10909.414386749268
+    time_gpu_max: 10971.16756439209
+    time_gpu_min: 9842.17643737793
+    time_gpu_avg: 10228.118419647217
