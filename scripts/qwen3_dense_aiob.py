@@ -110,6 +110,7 @@ class DenseQwen3Profiler:
 
         self._vllm_ops = None
         self._vllm_get_rope = None
+        self._vllm_silu_and_mul = None
         try:
             from vllm import _custom_ops as vllm_ops
             from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -120,6 +121,20 @@ class DenseQwen3Profiler:
             # torch.nn.functional.rms_norm remains a valid hardware kernel
             # fallback when vLLM custom operations are unavailable.
             pass
+
+        # vLLM 0.11 registers SiluAndMul directly in torch.ops._C instead of
+        # exposing it through vllm._custom_ops. Prefer the registered fused
+        # kernel in that case so the profile follows the real vLLM path.
+        if self._vllm_ops is not None:
+            self._vllm_silu_and_mul = getattr(
+                self._vllm_ops, "silu_and_mul", None
+            )
+        if self._vllm_silu_and_mul is None:
+            vllm_c_ops = getattr(self.torch.ops, "_C", None)
+            if vllm_c_ops is not None:
+                self._vllm_silu_and_mul = getattr(
+                    vllm_c_ops, "silu_and_mul", None
+                )
 
     def _release(self) -> None:
         gc.collect()
@@ -156,12 +171,10 @@ class DenseQwen3Profiler:
             self._vllm_ops, "fused_add_rms_norm"
         ):
             def operation() -> Any:
-                x_work = x.clone()
-                residual_work = residual.clone()
                 self._vllm_ops.fused_add_rms_norm(
-                    x_work, residual_work, weight, epsilon
+                    x, residual, weight, epsilon
                 )
-                return x_work
+                return x
         else:
             def operation() -> Any:
                 return self.functional.rms_norm(
@@ -321,22 +334,25 @@ class DenseQwen3Profiler:
             dtype=self.dtype,
         )
 
-        if self._vllm_ops is not None and hasattr(self._vllm_ops, "silu_and_mul"):
+        if self._vllm_silu_and_mul is not None:
+            output = torch.empty(
+                (self.active_tokens, self.local_intermediate_size),
+                device=self.device,
+                dtype=self.dtype,
+            )
+
             def operation() -> Any:
-                output = torch.empty(
-                    (self.active_tokens, self.local_intermediate_size),
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                self._vllm_ops.silu_and_mul(output, gate_up)
+                self._vllm_silu_and_mul(output, gate_up)
                 return output
         else:
+            output = None
+
             def operation() -> Any:
                 gate, up = gate_up.chunk(2, dim=-1)
                 return self.functional.silu(gate) * up
 
         result = _benchmark(torch, operation, self.loops, self.warmup_loops)
-        del gate_up
+        del gate_up, output
         self._release()
         return result
 
