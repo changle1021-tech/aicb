@@ -1,43 +1,43 @@
 {
     "atten_norm": {
         "variance": 0.0,
-        "P99": 2.201
+        "P99": 2.221
     },
     "atten_qkv": {
         "variance": 0.0,
-        "P99": 12.238
+        "P99": 10.777
     },
     "atten_rotary_emb": {
         "variance": 0.0,
-        "P99": 4.374
+        "P99": 3.157
     },
     "atten_flash": {
         "variance": 0.0,
-        "P99": 31.97
+        "P99": 21.727
     },
     "atten_o": {
         "variance": 0.0,
-        "P99": 10.178
+        "P99": 6.438
     },
     "gdn_qkv": {
         "variance": 0.0,
-        "P99": 8.327
+        "P99": 8.141
     },
     "gdn_causal_conv": {
         "variance": 0.0,
-        "P99": 1.9139999999999997
+        "P99": 1.9829999999999999
     },
     "gdn_core": {
         "variance": 0.0,
-        "P99": 7.047
+        "P99": 6.408999999999999
     },
     "gdn_o": {
         "variance": 0.0,
-        "P99": 4.795999999999999
+        "P99": 4.928000000000001
     },
     "moe_norm": {
         "variance": 0.0,
-        "P99": 2.703
+        "P99": 2.677
     },
     "moe_route_gate": {
         "variance": 0.0,
@@ -45,11 +45,11 @@
     },
     "moe_route_select_experts": {
         "variance": 0.0,
-        "P99": 4.825
+        "P99": 4.854
     },
     "moe_expert_up": {
         "variance": 0.0,
-        "P99": 43.297
+        "P99": 76.422
     },
     "moe_expert_act": {
         "variance": 0.0,
@@ -57,6 +57,6 @@
     },
     "moe_expert_down": {
         "variance": 0.0,
-        "P99": 25.112
+        "P99": 34.771
     }
 }
