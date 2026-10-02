@@ -1,0 +1,3 @@
+[submodule "src/sarathi"]
+	path = src/sarathi
+	url = https://github.com/microsoft/sarathi-serve.git

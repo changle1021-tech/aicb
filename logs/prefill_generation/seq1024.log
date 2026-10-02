@@ -1,0 +1,28 @@
+INFO 09-04 12:38:03 [__init__.py:216] Automatically detected platform cuda.
+W0904 12:38:05.738000 995806 site-packages/torch/utils/cpp_extension.py:2425] TORCH_CUDA_ARCH_LIST is not set, all archs for visible cards are included for compilation. 
+W0904 12:38:05.738000 995806 site-packages/torch/utils/cpp_extension.py:2425] If this is not desired, please set os.environ['TORCH_CUDA_ARCH_LIST'] to specific architectures.
+2026-09-04 12:38:08,537 - INFO - flashinfer.jit: Prebuilt kernels not found, using JIT backend
+WARNING 09-04 12:38:08 [__init__.py:755] Current vLLM config is not set.
+INFO 09-04 12:38:09 [deep_gemm.py:59] DeepGEMM E8M0 disabled on current configuration.
+Traceback (most recent call last):
+  File "/home/turbo_ops/miniconda3/envs/vidur/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/home/turbo_ops/miniconda3/envs/vidur/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/home/turbo_ops/changle/SimAI/aicb/workload_generator/Vidur_workload_generator.py", line 234, in <module>
+    aiob_output_filepath = aiob_model()
+  File "/home/turbo_ops/miniconda3/envs/vidur/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/turbo_ops/miniconda3/envs/vidur/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/turbo_ops/changle/SimAI/aicb/workload_generator/mocked_model/inference/AiobQwen3Next.py", line 628, in forward
+    atten_qkv, atten_rotary_emb, atten_core, atten_o = self.FullAttention()
+  File "/home/turbo_ops/miniconda3/envs/vidur/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/turbo_ops/miniconda3/envs/vidur/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/turbo_ops/changle/SimAI/aicb/workload_generator/mocked_model/inference/AiobQwen3Next.py", line 451, in forward
+    qkv_proj = self._attn_proj(True,m)
+  File "/home/turbo_ops/changle/SimAI/aicb/workload_generator/mocked_model/inference/AiobQwen3Next.py", line 319, in _attn_proj
+    deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, c=c, disable_ue8m0_cast=True, recipe = None)
+RuntimeError: Assertion error (csrc/apis/../jit_kernels/impls/../../jit/compiler.hpp:142): (major > 12 or (major == 12 and minor >= 3)) and "NVCC version should be >= 12.3"

@@ -1,0 +1,61 @@
+inference_term:decode
+atten_norm:
+    time_gpu_max: 2.6839999999999997
+    time_gpu_min: 2.204
+    time_gpu_avg: 2.5744
+atten_qkv:
+    time_gpu_max: 12.649000000000001
+    time_gpu_min: 11.962000000000002
+    time_gpu_avg: 12.1515
+atten_rotary_emb:
+    time_gpu_max: 4.523
+    time_gpu_min: 4.168
+    time_gpu_avg: 4.3168
+atten_flash:
+    time_gpu_max: 12.18
+    time_gpu_min: 11.987
+    time_gpu_avg: 12.0878
+atten_o:
+    time_gpu_max: 12.782
+    time_gpu_min: 9.583
+    time_gpu_avg: 10.883500000000002
+gdn_qkv:
+    time_gpu_max: 8.936
+    time_gpu_min: 8.193999999999999
+    time_gpu_avg: 8.3713
+gdn_causal_conv:
+    time_gpu_max: 1.95
+    time_gpu_min: 1.891
+    time_gpu_avg: 1.9139
+gdn_core:
+    time_gpu_max: 7.2509999999999994
+    time_gpu_min: 7.066
+    time_gpu_avg: 7.1256
+gdn_o:
+    time_gpu_max: 4.937
+    time_gpu_min: 4.678999999999999
+    time_gpu_avg: 4.7725
+moe_norm:
+    time_gpu_max: 2.677
+    time_gpu_min: 2.542
+    time_gpu_avg: 2.6134999999999997
+moe_route_gate:
+    time_gpu_max: 0.0
+    time_gpu_min: 0.0
+    time_gpu_avg: 0.0
+moe_route_select_experts:
+    time_gpu_max: 4.827
+    time_gpu_min: 4.786
+    time_gpu_avg: 4.798900000000001
+moe_expert_up:
+    time_gpu_max: 43.402
+    time_gpu_min: 43.077
+    time_gpu_avg: 43.237700000000004
+moe_expert_act:
+    time_gpu_max: 0.0
+    time_gpu_min: 0.0
+    time_gpu_avg: 0.0
+moe_expert_down:
+    time_gpu_max: 25.315
+    time_gpu_min: 24.776
+    time_gpu_avg: 25.0233
