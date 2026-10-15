@@ -10,7 +10,10 @@ from typing import Optional, Union, Tuple
 from workload_generator.mocked_model.inference.qwen3_next_projections import (
     projection_shapes, projection_precision, benchmark_projection,
     benchmark_input_quantization, benchmark_attention_output_gate,
-    write_projection_metadata,
+    write_projection_metadata, benchmark_gpu_region,
+)
+from workload_generator.mocked_model.inference.qwen3_next_moe import (
+    moe_parallel_layout, gathered_tokens, benchmark_routed_experts,
 )
 # import triton
 import numpy as np
@@ -422,127 +425,43 @@ class Qwen3NextSparseMoeBlock(torch.nn.Module):
     def __init__(self, args):
         super(Qwen3NextSparseMoeBlock, self).__init__()
         self.args = args
-        self.batch_size = args.micro_batch
         self.hidden_size = args.hidden_size
         self.num_experts = args.num_experts
-        self.tp = args.tensor_model_parallel_size
-        self.dp = args.world_size // self.tp // args.pipeline_model_parallel
-        self.ep = self.tp * self.dp
         self.topk = args.num_experts_per_tok
-    
-    def _route_gate(self, m):
-        # ReplicatedLinear
-        x = torch.randn(m, self.hidden_size, device='cuda', dtype=torch.bfloat16)
+        self.dp, self.ep, self.local_experts = moe_parallel_layout(args)
+
+    def _route_gate(self, tokens):
+        # ReplicatedLinear [hidden -> num_experts], BF16 like the served model
+        x = torch.randn(tokens, self.hidden_size, device='cuda', dtype=torch.bfloat16)
         w = torch.randn(self.num_experts, self.hidden_size, device='cuda', dtype=torch.bfloat16)
-        # print(x.shape, w.shape)
+        return benchmark_gpu_region(lambda: F.linear(x, w))
 
-        def test_func():
-            F.linear(x, w)
-
-        candidates = [
-            ("cutlass", "cublasLt::splitK"),
-            ("nvjet_tst", "cublasLt::splitK"),
-            "cutlass",
-            "nvjet_tst",
-        ]
-        last_err = None
-        for names in candidates:
-            try:
-                res = bench_kineto(test_func, names, suppress_kineto_output=True)
-                return sum(res) if isinstance(res, (list, tuple)) else float(res)
-            except Exception as e:
-                last_err = e
-                continue
-
-        raise RuntimeError(f"bench_kineto failed for all candidates: {last_err}")      
-
-    def _select_experts(self, total_tokens):
+    def _select_experts(self, tokens):
         # FusedMoE.select_experts
-        hidden_states = torch.randn(total_tokens, self.hidden_size, device='cuda', dtype=torch.bfloat16)
-        router_logits = torch.randn(total_tokens, self.num_experts, device='cuda', dtype=torch.bfloat16)
+        hidden_states = torch.randn(tokens, self.hidden_size, device='cuda', dtype=torch.bfloat16)
+        router_logits = torch.randn(tokens, self.num_experts, device='cuda', dtype=torch.bfloat16)
 
         def test_func():
             fused_topk(hidden_states=hidden_states,
-                            gating_output=router_logits,
-                            topk=self.topk,
-                            renormalize=True)
-        t = bench_kineto(test_func, 'moe::topkGatingSoftmax', suppress_kineto_output=True)
-        return t
-
-    def _moe_gate_proj(self, up_or_down, m):
-        num_groups = self.num_experts // self.ep
-        strategy = getattr(self.args, "moe_routing_strategy", Strategy.RoundRobin)
-        expected_m_per_group = get_ep_expected_m_per_group(
-            m, num_groups, self.topk, self.ep, strategy
-        )
-        if up_or_down:
-            n = 2 * self.args.moe_intermediate_size
-            k = self.hidden_size
-        else:
-            n = self.hidden_size
-            k = self.args.moe_intermediate_size
-
-        phase = getattr(self.args, "phase", InferencePhase.DECODE.value)
-
-        if phase == InferencePhase.DECODE.value:
-            t = bench_masked(num_groups, expected_m_per_group, k, n)
-        elif phase == InferencePhase.PREFILL.value:
-            t = bench_contiguous(num_groups, expected_m_per_group, k, n)
-
-        return t
-
-    def _moe_act(self, m):
-        # SiluAndMul
-        num_groups=self.num_experts // self.ep
-        total = m * self.dp * self.topk // self.num_experts
-        n = 2 * self.args.moe_intermediate_size
-
-        total_max = total # TODO: maybe should set in config
-        intermediate_cache1 = torch.randn((num_groups * total_max, n),
-                                        device='cuda',
-                                        dtype=torch.bfloat16)
-        intermediate_cache2 = torch.randn((num_groups * total_max, n // 2),
-                                        device='cuda',
-                                        dtype=torch.bfloat16)
-        
-        def test_func():
-            torch.ops._C.silu_and_mul(
-                intermediate_cache2.unflatten(0, (num_groups, total_max)),
-                intermediate_cache1.unflatten(0, (num_groups, total_max)))
-            
-
-        candidates = [
-            "vllm::silu",
-            "vectorized_elementwise_kernel",
-        ]
-        last_err = None
-        for names in candidates:
-            try:
-                res = bench_kineto(test_func, names, suppress_kineto_output=True)
-                return sum(res) if isinstance(res, (list, tuple)) else float(res)
-            except Exception as e:
-                last_err = e
-                continue
-
-        raise RuntimeError(f"bench_kineto failed for all candidates: {last_err}")
-
+                       gating_output=router_logits,
+                       topk=self.topk,
+                       renormalize=True)
+        return benchmark_gpu_region(test_func)
 
     def forward(self):
         phase = getattr(self.args, "phase", InferencePhase.DECODE.value)
         if phase == InferencePhase.DECODE.value:
-            m = self.args.micro_batch
-            total_tokens = m  # TODO: maybe should set output seq_length
+            local_tokens = self.args.micro_batch
         elif phase == InferencePhase.PREFILL.value:
-            m = self.args.seq_length
-            total_tokens = m
+            local_tokens = self.args.seq_length
 
-        route_gate = self._route_gate(m)
-        route_select_experts = self._select_experts(total_tokens)
-        moe_up = self._moe_gate_proj(True, m)
-        moe_act = self._moe_act(m)
-        moe_down = self._moe_gate_proj(False, m)
+        # vLLM AG/RS EP: router and top-k run after the DP all-gather.
+        tokens = gathered_tokens(local_tokens, self.dp)
+        route_gate = self._route_gate(tokens)
+        route_select_experts = self._select_experts(tokens)
+        routed_experts = benchmark_routed_experts(self.args, local_tokens)
 
-        return route_gate, route_select_experts, moe_up, moe_act, moe_down
+        return route_gate, route_select_experts, routed_experts
 
 
 class Qwen3NextModel(torch.nn.Module):
@@ -618,21 +537,15 @@ class Qwen3NextModel(torch.nn.Module):
                     )
 
             # 4. mlp
-            moe_route_gate, moe_route_select_experts, moe_up, moe_act, moe_down = self.MoE()
+            moe_route_gate, moe_route_select_experts, moe_routed = self.MoE()
             self.time_list.setdefault("moe_route_gate", []).append(
                         {"time_gpu": moe_route_gate* 1e6}
                     )
             self.time_list.setdefault("moe_route_select_experts", []).append(
                         {"time_gpu": moe_route_select_experts* 1e6}
                     )
-            self.time_list.setdefault("moe_expert_up", []).append(
-                        {"time_gpu": moe_up* 1e6}
-                    )
-            self.time_list.setdefault("moe_expert_act", []).append(
-                        {"time_gpu": moe_act* 1e6}
-                    )
-            self.time_list.setdefault("moe_expert_down", []).append(
-                        {"time_gpu": moe_down* 1e6}
+            self.time_list.setdefault("moe_expert_routed", []).append(
+                        {"time_gpu": moe_routed* 1e6}
                     )
         
         print(self.time_list)
