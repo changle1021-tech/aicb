@@ -114,3 +114,34 @@ def _benchmark_routed_experts_fp8(args, local_tokens, dp, ep, local_experts):
     up = bench(local_experts, expected_m, hidden, 2 * inter, loads=loads)
     down = bench(local_experts, expected_m, inter, hidden, loads=loads)
     return up + down
+
+
+def benchmark_shared_expert(args, local_tokens):
+    """Device time of the shared expert on one DP rank.
+
+    The shared expert is replicated (not EP-sharded) and runs on this rank's
+    own tokens: gate/up [hidden -> 2*inter], SiluAndMul, down [inter -> hidden],
+    then multiplies by sigmoid(shared_expert_gate(x)).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    hidden = _positive_int("hidden_size", args.hidden_size)
+    inter = _positive_int("shared_expert_intermediate_size", getattr(
+        args, "shared_expert_intermediate_size", args.moe_intermediate_size))
+    tokens = _positive_int("local_tokens", local_tokens)
+
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    w_up = torch.randn(2 * inter, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    w_down = torch.randn(hidden, inter, device="cuda", dtype=torch.bfloat16) * 0.02
+    w_gate = torch.randn(1, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    def run():
+        up = F.linear(x, w_up)
+        act = torch.empty(tokens, inter, device="cuda", dtype=torch.bfloat16)
+        torch.ops._C.silu_and_mul(act, up)
+        down = F.linear(act, w_down)
+        gate = torch.sigmoid(F.linear(x, w_gate))
+        return down * gate
+
+    return benchmark_gpu_region(run)

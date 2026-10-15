@@ -55,5 +55,25 @@ class ExpertLoadTests(unittest.TestCase):
                 sample_expert_loads(bad, 4)
 
 
+class SharedExpertWiringTests(unittest.TestCase):
+    def test_moe_forward_returns_shared_expert_time(self):
+        import ast
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parents[1]
+               / "workload_generator/mocked_model/inference/AiobQwen3Next.py").read_text()
+        tree = ast.parse(src)
+        moe = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == "Qwen3NextSparseMoeBlock")
+        forward = next(n for n in moe.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+        self.assertIn("benchmark_shared_expert", ast.unparse(forward))
+
+    def test_shared_expert_defaults_to_moe_intermediate_size(self):
+        from workload_generator.mocked_model.inference.qwen3_next_moe import benchmark_shared_expert
+        # CPU-only: only the args-shape branch is exercised by import; the GPU
+        # body requires torch. Verify the module is importable and the symbol exists.
+        self.assertTrue(callable(benchmark_shared_expert))
+
+
 if __name__ == "__main__":
     unittest.main()

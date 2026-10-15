@@ -14,6 +14,7 @@ from workload_generator.mocked_model.inference.qwen3_next_projections import (
 )
 from workload_generator.mocked_model.inference.qwen3_next_moe import (
     moe_parallel_layout, gathered_tokens, benchmark_routed_experts,
+    benchmark_shared_expert,
 )
 from workload_generator.mocked_model.inference.qwen3_next_attention import (
     benchmark_gdn_conv, benchmark_gdn_core, benchmark_kv_cache_save,
@@ -394,8 +395,9 @@ class Qwen3NextSparseMoeBlock(torch.nn.Module):
         route_gate = self._route_gate(tokens)
         route_select_experts = self._select_experts(tokens)
         routed_experts = benchmark_routed_experts(self.args, local_tokens)
+        shared_expert = benchmark_shared_expert(self.args, local_tokens)
 
-        return route_gate, route_select_experts, routed_experts
+        return route_gate, route_select_experts, routed_experts, shared_expert
 
 
 class Qwen3NextModel(torch.nn.Module):
@@ -471,7 +473,7 @@ class Qwen3NextModel(torch.nn.Module):
                     )
 
             # 4. mlp
-            moe_route_gate, moe_route_select_experts, moe_routed = self.MoE()
+            moe_route_gate, moe_route_select_experts, moe_routed, moe_shared = self.MoE()
             self.time_list.setdefault("moe_route_gate", []).append(
                         {"time_gpu": moe_route_gate* 1e6}
                     )
@@ -480,6 +482,9 @@ class Qwen3NextModel(torch.nn.Module):
                     )
             self.time_list.setdefault("moe_expert_routed", []).append(
                         {"time_gpu": moe_routed* 1e6}
+                    )
+            self.time_list.setdefault("moe_shared_expert", []).append(
+                        {"time_gpu": moe_shared* 1e6}
                     )
         
         print(self.time_list)

@@ -189,7 +189,7 @@ class ProjectionWiringTests(unittest.TestCase):
         obj._norm = lambda: 0
         obj.FullAttention = lambda: (1e-6, 2e-6, 3e-6, 4e-6, 5e-6)
         obj.GDN = lambda: (0, 0, 0, 0)
-        obj.MoE = lambda: (0, 0, 0)
+        obj.MoE = lambda: (0, 0, 0, 0)
         # The existing parser is stdlib-only once extracted from the large
         # utils module; no GPU package has to be imported for this contract.
         parser_ast = ast.parse((ROOT / "utils/utils.py").read_text())
