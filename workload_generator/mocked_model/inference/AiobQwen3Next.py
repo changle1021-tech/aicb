@@ -7,6 +7,11 @@ from utils.deepgemm_utils import *
 import torch.nn.functional as F
 import random
 from typing import Optional, Union, Tuple
+from workload_generator.mocked_model.inference.qwen3_next_projections import (
+    projection_shapes, projection_precision, benchmark_projection,
+    benchmark_input_quantization, benchmark_attention_output_gate,
+    write_projection_metadata,
+)
 # import triton
 import numpy as np
 from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
@@ -89,6 +94,7 @@ class Qwen3NextGatedDeltaNet(torch.nn.Module):
         super(Qwen3NextGatedDeltaNet, self).__init__()
         self.args = args
         self.tp = self.args.tensor_model_parallel_size
+        self.shapes = projection_shapes(self.args)
 
         self.norm = RMSNormGated(
             self.args.linear_value_head_dim,
@@ -99,41 +105,13 @@ class Qwen3NextGatedDeltaNet(torch.nn.Module):
         )
 
     def _attn_quant(self, qk_or_o, m):
-        if qk_or_o:
-            n = self.args.hidden_size
-        else:
-            n = self.args.num_attention_heads * self.args.head_dim // self.tp
-        input = torch.randn(m, n, device='cuda', dtype=torch.bfloat16)
-        def test_func():
-            per_token_group_quant_fp8(input, 128, column_major_scales=True)
+        width = self.shapes.hidden_size if qk_or_o else self.shapes.gdn_value_size
+        return benchmark_input_quantization(self.args, m, width)
 
-        candidates = [
-            'per_token_group_quant_fp8', # old version
-            'per_token_group_quant_8bit', # new version
-        ]
-        last_err = None
-        for names in candidates:
-            try:
-                t = bench_kineto(test_func, names, suppress_kineto_output=True)
-                return t
-            except Exception as e:
-                last_err = e
-                continue
-
-        raise RuntimeError(f"bench_kineto failed for all candidates: {last_err}")
     
     def _attn_proj(self, k, n, m):
-        x_fp8, y_fp8, c, out, ref_out = construct(m, k, n)
-        # deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-        deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, c=c, disable_ue8m0_cast=True, recipe = None)
-        diff = calc_diff(out, ref_out)
-        assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
-        x_fp8, y_fp8, c, out, ref_out = construct(m, k, n)
-        def test_func():
-            # deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-            deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, c=c, disable_ue8m0_cast=True, recipe = None)
-        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-        return t
+        return benchmark_projection(self.args, m, k, n)
+
 
     def _causal_conv(self, m):
         n = (self.args.num_attention_heads * self.args.head_dim + self.args.linear_num_key_heads*self.args.linear_key_head_dim + self.args.linear_num_value_heads*self.args.linear_value_head_dim) // self.tp
@@ -244,11 +222,11 @@ class Qwen3NextGatedDeltaNet(torch.nn.Module):
         qkv_quant = self._attn_quant(True, m)
         
         qkvz_proj_k = self.args.hidden_size
-        qkvz_proj_n = (self.args.linear_value_head_dim+self.args.linear_value_head_dim)*2 // self.tp
+        qkvz_proj_n = self.shapes.gdn_qkvz_size
         qkvz_proj = self._attn_proj(qkvz_proj_k, qkvz_proj_n, m)
 
         ba_proj_k = self.args.hidden_size
-        ba_proj_n = self.args.linear_num_value_heads*2 // self.tp
+        ba_proj_n = self.shapes.gdn_ba_size
         ba_proj = self._attn_proj(ba_proj_k, ba_proj_n, m)
         
         attn_qkv = qkv_quant+qkvz_proj+ba_proj
@@ -268,7 +246,7 @@ class Qwen3NextGatedDeltaNet(torch.nn.Module):
 
         o_norm = self._norm(m)
         o_quant = self._attn_quant(False, m)
-        o_proj_k = self.args.linear_value_head_dim // self.tp
+        o_proj_k = self.shapes.gdn_value_size
         o_proj_n = self.args.hidden_size
         o_proj = self._attn_proj(o_proj_k,o_proj_n, m)
         
@@ -282,55 +260,26 @@ class Qwen3NextAttention(torch.nn.Module):
         super(Qwen3NextAttention, self).__init__()
         self.args = args
         self.tp = self.args.tensor_model_parallel_size
+        self.shapes = projection_shapes(self.args)
     
     def _attn_quant(self, qk_or_o, m):
-        if qk_or_o:
-            n = self.args.hidden_size
-        else:
-            n = self.args.num_attention_heads * self.args.head_dim // self.tp
-        input = torch.randn(m, n, device='cuda', dtype=torch.bfloat16)
-        def test_func():
-            per_token_group_quant_fp8(input, 128, column_major_scales=True)
+        width = self.shapes.hidden_size if qk_or_o else self.shapes.attention_query_size
+        return benchmark_input_quantization(self.args, m, width)
 
-        candidates = [
-            'per_token_group_quant_fp8', # old version
-            'per_token_group_quant_8bit', # new version
-        ]
-        last_err = None
-        for names in candidates:
-            try:
-                t = bench_kineto(test_func, names, suppress_kineto_output=True)
-                return t
-            except Exception as e:
-                last_err = e
-                continue
-
-        raise RuntimeError(f"bench_kineto failed for all candidates: {last_err}")
 
     def _attn_proj(self, qk_or_o, m):
         if qk_or_o:
-            n = (self.args.num_attention_heads + self.args.num_key_value_heads * 2) * self.args.head_dim // self.tp
-            k = self.args.hidden_size
+            k, n = self.shapes.hidden_size, self.shapes.attention_qkv_size
         else:
-            n = self.args.hidden_size
-            k = self.args.num_attention_heads  * self.args.head_dim // self.tp
-        x_fp8, y_fp8, c, out, ref_out = construct(m, k, n)
-        # deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-        deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, c=c, disable_ue8m0_cast=True, recipe = None)
-        diff = calc_diff(out, ref_out)
-        assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
-        x_fp8, y_fp8, c, out, ref_out = construct(m, k, n)
-        def test_func():
-            # deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
-            deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, c=c, disable_ue8m0_cast=True, recipe = None)
-        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-        return t
+            k, n = self.shapes.attention_query_size, self.shapes.hidden_size
+        return benchmark_projection(self.args, m, k, n)
+
     def _qk_norm(self, q_or_k, m):
         head_dim = self.args.head_dim
         if q_or_k:
-            n = self.args.num_attention_heads * head_dim // self.tp
+            n = self.shapes.attention_query_size
         else:
-            n = self.args.num_key_value_heads * head_dim // self.tp
+            n = self.shapes.attention_kv_size
         x = torch.randn(m,n, device='cuda', dtype=torch.bfloat16)
         x = x.view(*x.shape[:-1], x.shape[-1] // head_dim, head_dim)
         residual = torch.rand_like(x, device='cuda', dtype=torch.bfloat16)
@@ -338,8 +287,8 @@ class Qwen3NextAttention(torch.nn.Module):
             
     def _rotary_emb(self, m):
         head_dim = self.args.head_dim
-        n_q = self.args.num_attention_heads * head_dim // self.tp
-        n_k = self.args.num_key_value_heads * head_dim // self.tp
+        n_q = self.shapes.attention_query_size
+        n_k = self.shapes.attention_kv_size
 
         q = torch.randn(m, n_q, device='cuda', dtype=torch.bfloat16)
         k = torch.randn(m, n_k, device='cuda', dtype=torch.bfloat16)
@@ -365,8 +314,8 @@ class Qwen3NextAttention(torch.nn.Module):
         num_blocks = 32768 
         
         head_size = self.args.head_dim
-        num_query_heads = self.args.num_attention_heads // self.tp
-        num_kv_heads = self.args.num_key_value_heads// self.tp
+        num_query_heads = self.shapes.attention_query_heads
+        num_kv_heads = self.shapes.attention_kv_heads
         dtype = torch.bfloat16
 
 
@@ -460,11 +409,14 @@ class Qwen3NextAttention(torch.nn.Module):
         attn = self._attn_core(kv_lens)
 
         # o
+        output_gate = benchmark_attention_output_gate(
+            self.args, m, self.shapes.attention_query_size
+        )
         o_quant = self._attn_quant(False,m)
         o_proj = self._attn_proj(False,m)
         attn_o = o_quant + o_proj
 
-        return attn_qkv, rotary_emb, attn, attn_o
+        return attn_qkv, rotary_emb, attn, attn_o, output_gate
 
 class Qwen3NextSparseMoeBlock(torch.nn.Module):
     def __init__(self, args):
@@ -598,6 +550,7 @@ class Qwen3NextModel(torch.nn.Module):
         super(Qwen3NextModel, self).__init__()
         self.time_list = {}
         self.args = args
+        projection_precision(args)
         # self.Embedding = Qwen3Embedding(self.args)
         self.FullAttention = Qwen3NextAttention(self.args)
         self.GDN = Qwen3NextGatedDeltaNet(self.args)
@@ -625,7 +578,7 @@ class Qwen3NextModel(torch.nn.Module):
                         {"time_gpu": pre_norm* 1e6}
                     )
             # 2.A. self_attn
-            atten_qkv, atten_rotary_emb, atten_core, atten_o = self.FullAttention()
+            atten_qkv, atten_rotary_emb, atten_core, atten_o, atten_output_gate = self.FullAttention()
             self.time_list.setdefault("atten_qkv", []).append(
                         {"time_gpu": atten_qkv* 1e6}
                     )
@@ -639,6 +592,10 @@ class Qwen3NextModel(torch.nn.Module):
                         {"time_gpu": atten_o* 1e6}
                     )
             
+            self.time_list.setdefault("atten_output_gate", []).append(
+                {"time_gpu": atten_output_gate * 1e6}
+            )
+
             # 2.B. linear_attn
             gdn_qkv, gdn_causal_conv, gdn_core, gdn_o = self.GDN()
             self.time_list.setdefault("gdn_qkv", []).append(
@@ -687,6 +644,7 @@ class Qwen3NextModel(torch.nn.Module):
         calculate_stats(self.time_list, file_name)
         filepath = write_time(self.time_list, self.args)
         process_all_keys(filepath)
+        write_projection_metadata(filepath, self.args)
         return filepath
     
 
@@ -695,4 +653,4 @@ if __name__ == "__main__":
     x = torch.randint(0, args.vocab_size, (2, 1))
     model = Qwen3NextModel(args)
     filepath = model(x)
-    print(filepath)     
+    print(filepath)

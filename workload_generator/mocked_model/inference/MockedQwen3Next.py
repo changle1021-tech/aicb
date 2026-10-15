@@ -74,6 +74,13 @@ class Qwen3NextParams(MockedParamsBase):
         # Initialize base class with default values
         super().__init__("Qwen3-Next-80B", "Qwen3-Next", config_file, args)
 
+        # These projection options are specific to Qwen3-Next. An omitted CLI
+        # option must not override a value loaded from the model config.
+        for name in ("projection_precision", "attn_output_gate"):
+            value = getattr(args, name, None)
+            if value is not None:
+                setattr(self, name, value)
+
         # Recalculate total_experts if needed
         if hasattr(self, 'router_expert') or hasattr(self, 'duped_expert'):
             self.num_experts = self.router_expert + self.duped_expert

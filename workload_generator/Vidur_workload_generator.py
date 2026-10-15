@@ -9,6 +9,9 @@ import workload_generator.mocked_model.inference.MockedQwen3Next as MockedQwen3N
 from workload_generator.mocked_model.MockedModel import InferencePhase
 from workload_generator.SimAI_inference_workload_generator import _get_aiob_compute_time, _get_model_details, LayerInfo
 from utils.utils import CommType, get_params, get_comp_out, extract_inference_averages
+from workload_generator.mocked_model.inference.qwen3_next_projections import (
+    validate_projection_metadata, write_projection_metadata,
+)
 import os
 from typing import List, Tuple
 from collections import deque
@@ -187,6 +190,12 @@ if __name__ == "__main__":
     # Add arguments that has default value
     parser.add_argument("--aiob_enable", action="store_true", default=False, help="Enable AIOB")
     parser.add_argument("--aiob_forward_loops", type=int, default=1, help="Number of AIOB forward loops")
+    parser.add_argument("--projection_precision", choices=["bf16", "fp8"], default=None,
+                        help="Qwen3-Next projection precision (default: model torch_dtype)")
+    gate_options = parser.add_mutually_exclusive_group()
+    gate_options.add_argument("--attn_output_gate", dest="attn_output_gate", action="store_true")
+    gate_options.add_argument("--no_attn_output_gate", dest="attn_output_gate", action="store_false")
+    parser.set_defaults(attn_output_gate=None)
     parser.add_argument("--seq_length", type=int, default=1, help="Sequence length")
     parser.add_argument("--micro_batch", type=int, default=1, help="Micro batch size")
     parser.add_argument("--world_size", type=int, default=1, help="World size")
@@ -249,6 +258,8 @@ if __name__ == "__main__":
             aiob_output_filepath = ""
         else:
             print(f"aiob not enabled, using existing file {aiob_output_filepath}.")
+    if "Qwen3-Next" in model_name:
+        validate_projection_metadata(aiob_output_filepath, args)
     compute_cache = extract_inference_averages(aiob_output_filepath,args)
     print("compute_cache = {")
     for key, value in compute_cache.items():
@@ -261,6 +272,8 @@ if __name__ == "__main__":
     work.workload_generate_aiob()
     filepath = os.path.join(result_dir, filename)
     work.dump_file(filepath)
+    if "Qwen3-Next" in model_name:
+        write_projection_metadata(filepath + ".csv", args)
     print("workload save in :", filepath)
     print("Finish Model initialization")
     
