@@ -15,6 +15,9 @@ from workload_generator.mocked_model.inference.qwen3_next_projections import (
 from workload_generator.mocked_model.inference.qwen3_next_moe import (
     moe_parallel_layout, gathered_tokens, benchmark_routed_experts,
 )
+from workload_generator.mocked_model.inference.qwen3_next_attention import (
+    benchmark_gdn_conv, benchmark_gdn_core, benchmark_kv_cache_save,
+)
 # import triton
 import numpy as np
 from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
@@ -117,16 +120,8 @@ class Qwen3NextGatedDeltaNet(torch.nn.Module):
 
 
     def _causal_conv(self, m):
-        n = (self.args.num_attention_heads * self.args.head_dim + self.args.linear_num_key_heads*self.args.linear_key_head_dim + self.args.linear_num_value_heads*self.args.linear_value_head_dim) // self.tp
-
-        def test_func():
-            test_causal_conv1d_update(batch=m, 
-                                      dim=n, 
-                                      width=self.args.linear_conv_kernel_dim,
-                                      seqlen=1, # TODO decoding self.args.seq_length
-                                      has_bias=False, silu_activation=True, itype=torch.bfloat16)
-        t = bench_kineto(test_func, "_causal_conv1d_update_kernel", suppress_kineto_output=True)
-        return t
+        phase = getattr(self.args, "phase", InferencePhase.DECODE.value)
+        return benchmark_gdn_conv(self.args, phase, m)
 
     def _fused_gdn_gating(self, m):
         A_log = torch.empty(
@@ -137,7 +132,7 @@ class Qwen3NextGatedDeltaNet(torch.nn.Module):
         dt_bias = torch.ones(self.args.linear_num_value_heads // self.tp)
 
         batch, num_heads = a.shape
-        seq_len=1 # TODO decoding self.args.seq_length
+        seq_len=1
         grid = (batch, seq_len, triton.cdiv(num_heads, 8))
         g = torch.empty_like(a, dtype=torch.float32)
 
@@ -157,50 +152,7 @@ class Qwen3NextGatedDeltaNet(torch.nn.Module):
     
     def _fused_gdn_core(self):
         phase = getattr(self.args, "phase", InferencePhase.DECODE.value)
-        if phase == InferencePhase.DECODE.value:
-            B = self.args.micro_batch
-            T = 1
-        elif phase == InferencePhase.PREFILL.value:
-            B = 1
-            T = self.args.seq_length
-
-        H = self.args.linear_num_key_heads // self.tp
-        HV = self.args.linear_num_value_heads // self.tp
-        K = self.args.linear_key_head_dim
-        V = self.args.linear_value_head_dim
-
-        # 1 is for decoding
-        q = torch.randn(B, 1, H, K, device='cuda', dtype=torch.bfloat16).contiguous()
-        k = F.normalize(torch.randn(B, 1, H, K, device='cuda', dtype=torch.bfloat16), p=2, dim=-1).contiguous()
-        v = torch.randn(B, 1, HV, V, device='cuda', dtype=torch.bfloat16).contiguous()
-        g = F.logsigmoid(torch.rand(B, 1, HV, device='cuda', dtype=torch.bfloat16)).contiguous()
-        beta = torch.rand(B, 1, HV, device='cuda', dtype=torch.bfloat16).sigmoid().contiguous()
-        # h0 = torch.empty(B, HV, V, device=q.device, dtype=v.dtype)
-        h0 = torch.randn(B, HV, K, V, device='cuda', dtype=torch.bfloat16).contiguous()
-
-        ssm = torch.zeros(B*T, device='cuda', dtype=torch.int32).contiguous()
-
-        # print('q', q.shape, q.stride())
-        # print('k', k.shape, k.stride())
-        # print('v', v.shape, v.stride())
-        # print('g', g.shape, g.stride())
-        # print('beta', None if beta is None else beta.shape)
-        # print('init_ht', None if h0 is None else h0.shape)
-        # print('ssm', None if ssm is None else ssm.shape)
-
-        def test_func():
-            o, ht = fused_recurrent_gated_delta_rule(
-                q, k, v, g, beta,
-                initial_state=h0,
-                inplace_final_state=True,
-                # inplace_final_state=False,
-                ssm_state_indices=ssm,
-                # ssm_state_indices=None,
-                # use_qk_l2norm_in_kernel=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-        t = bench_kineto(test_func, "fused_recurrent_gated_delta_rule_fwd_kernel", suppress_kineto_output=True)
-        return t
+        return benchmark_gdn_core(self.args, phase, self.args.micro_batch, self.args.seq_length)
         
     def _norm(self, m):
         k = self.args.linear_num_value_heads // self.tp
@@ -312,91 +264,72 @@ class Qwen3NextAttention(torch.nn.Module):
         t = bench_kineto(test_func, 'rotary_embedding_kernel', suppress_kineto_output=True)
         return t
 
-    def _attn_core(self, kv_lens):
+    def _attn_core(self, kv_lens, q_lens):
         block_size = 32
-        num_blocks = 32768 
         
         head_size = self.args.head_dim
         num_query_heads = self.shapes.attention_query_heads
         num_kv_heads = self.shapes.attention_kv_heads
         dtype = torch.bfloat16
+        prefill = any(q > 1 for q in q_lens)
 
-
-        # based on vllm:test_flashinfer_decode_with_paged_kv
         torch.set_default_device("cuda")
         num_seqs = len(kv_lens)
         assert num_query_heads % num_kv_heads == 0
-        max_kv_len = max(kv_lens)
-        scale = head_size**-0.5
         soft_cap = None
 
-        query = torch.randn(num_seqs, num_query_heads, head_size, dtype=dtype)
-
-        key_value_cache = torch.randn(num_blocks,
-                                    2,
-                                    block_size,
-                                    num_kv_heads,
-                                    head_size,
-                                    dtype=dtype)
-        # key_cache = key_value_cache[:, 0, :, :, :].squeeze(1)
-        # value_cache = key_value_cache[:, 1, :, :, :].squeeze(1)
-
-        max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-        block_tables = torch.randint(0,
-                                    num_blocks,
-                                    (num_seqs, max_num_blocks_per_seq),
-                                    dtype=torch.int32)
-
         kv_indptr = [0]
-        kv_indices = []
-        kv_last_page_lens = []
-        for i in range(num_seqs):
-            seq_len = kv_lens[i]
+        for seq_len in kv_lens:
             assert seq_len > 0
-            num_blocks = (seq_len + block_size - 1) // block_size
-            kv_indices.extend(block_tables[i, :num_blocks])
-            kv_indptr.append(kv_indptr[-1] + num_blocks)
-            kv_last_page_len = seq_len % block_size
-            if kv_last_page_len == 0:
-                kv_last_page_len = block_size
-            kv_last_page_lens.append(kv_last_page_len)
+            kv_indptr.append(kv_indptr[-1] + (seq_len + block_size - 1) // block_size)
+        num_blocks = kv_indptr[-1]
+        kv_indices = torch.randperm(num_blocks, dtype=torch.int32)
+        kv_last_page_lens = [seq_len % block_size or block_size for seq_len in kv_lens]
+        key_value_cache = torch.randn(num_blocks, 2, block_size, num_kv_heads, head_size, dtype=dtype)
 
         kv_indptr = torch.tensor(kv_indptr, dtype=torch.int32)
-        kv_indices = torch.tensor(kv_indices, dtype=torch.int32)
         kv_last_page_lens = torch.tensor(kv_last_page_lens, dtype=torch.int32)
+        query = torch.randn(sum(q_lens), num_query_heads, head_size, dtype=dtype)
         
         # 128 MB 
         workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8)
-        wrapper = flashinfer.\
-            BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD",
-                    use_tensor_cores=(
-                        (num_query_heads//num_kv_heads) > 4)
-                    )
-        wrapper.plan(kv_indptr,
-                    kv_indices,
-                    kv_last_page_lens,
-                    num_query_heads,
-                    num_kv_heads,
-                    head_size,
-                    block_size,
-                    "NONE",
-                    q_data_type=dtype,
-                    kv_data_type=dtype,
-                    logits_soft_cap=soft_cap)
-        
-        def test_func():
-            wrapper.run(query, key_value_cache)
-        t = bench_kineto(test_func, 'BatchPrefillWithPagedKVCacheKernel', suppress_kineto_output=True)
-        return t
+        if prefill:
+            qo_indptr = torch.tensor([0] + list(np.cumsum(q_lens)), dtype=torch.int32)
+            wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+            wrapper.plan(qo_indptr, kv_indptr, kv_indices, kv_last_page_lens,
+                         num_query_heads, num_kv_heads, head_size, block_size,
+                         causal=True, q_data_type=dtype, kv_data_type=dtype,
+                         logits_soft_cap=soft_cap)
+        else:
+            wrapper = flashinfer.\
+                BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD",
+                        use_tensor_cores=(
+                            (num_query_heads//num_kv_heads) > 4)
+                        )
+            wrapper.plan(kv_indptr,
+                        kv_indices,
+                        kv_last_page_lens,
+                        num_query_heads,
+                        num_kv_heads,
+                        head_size,
+                        block_size,
+                        "NONE",
+                        q_data_type=dtype,
+                        kv_data_type=dtype,
+                        logits_soft_cap=soft_cap)
+        torch.set_default_device("cpu")
+        return benchmark_gpu_region(lambda: wrapper.run(query, key_value_cache))
 
     def forward(self):
         phase = getattr(self.args, "phase", InferencePhase.DECODE.value)
         if phase == InferencePhase.DECODE.value:
             m = self.args.micro_batch
             kv_lens = [self.args.seq_length] * m
+            q_lens = [1] * m
         elif phase == InferencePhase.PREFILL.value:
             m = self.args.seq_length
-            kv_lens = [self.args.seq_length] * 1
+            kv_lens = [self.args.seq_length]
+            q_lens = [m]
 
         # qkv
         qkv_quant = self._attn_quant(True,m)
@@ -408,8 +341,9 @@ class Qwen3NextAttention(torch.nn.Module):
         # rotary_embedding
         rotary_emb = self._rotary_emb(m)
 
-        # core
-        attn = self._attn_core(kv_lens)
+        # core: write this step's K/V into the paged cache, then attend
+        kv_cache_save = benchmark_kv_cache_save(self.args, m)
+        attn = kv_cache_save + self._attn_core(kv_lens, q_lens)
 
         # o
         output_gate = benchmark_attention_output_gate(

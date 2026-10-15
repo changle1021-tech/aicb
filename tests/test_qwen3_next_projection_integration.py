@@ -45,6 +45,7 @@ def load_profiling_classes():
         "benchmark_projection": Mock(return_value=1.0),
         "benchmark_input_quantization": Mock(return_value=0.0),
         "benchmark_attention_output_gate": Mock(return_value=2.0),
+        "benchmark_kv_cache_save": Mock(return_value=0.0),
         "projection_precision": projections.projection_precision,
         "projection_shapes": projections.projection_shapes,
         "write_projection_metadata": Mock(),
