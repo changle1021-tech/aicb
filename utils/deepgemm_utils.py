@@ -88,6 +88,7 @@ def generate_m_grouped_masked(
     k: int,
     use_ue8m0: bool = False,
     use_bf16: bool = False,
+    loads=None,
 ):
     a = torch.randn((num_groups, max_m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
@@ -95,8 +96,12 @@ def generate_m_grouped_masked(
     ref_d = torch.einsum("gmk,gnk->gmn", a, b)
 
     masked_m = torch.empty((num_groups,), device="cuda", dtype=torch.int)
-    for j in range(num_groups):
-        masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
+    if loads is not None:
+        assert len(loads) == num_groups
+        masked_m.copy_(torch.tensor(loads, dtype=torch.int))
+    else:
+        for j in range(num_groups):
+            masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
     assert masked_m.amax().item() <= max_m
 
     if use_bf16:
@@ -136,8 +141,13 @@ def generate_m_grouped_contiguous(
     major_b: MajorTypeAB,
     use_ue8m0: bool = False,
     use_bf16: bool = False,
+    loads=None,
 ):
-    actual_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
+    if loads is not None:
+        assert len(loads) == num_groups
+        actual_ms = list(loads)
+    else:
+        actual_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
     aligned_ms = [align(actual_m, get_mk_alignment_for_contiguous_layout()) for actual_m in actual_ms]
     m = sum(aligned_ms)
 
@@ -207,10 +217,12 @@ def test_func_contiguous(num_groups, expected_m_per_group, k, n) -> None:
         a_fp8, b_fp8, d, m_indices, disable_ue8m0_cast=True
     )
 
-def bench_masked(num_groups, expected_m_per_group, k, n) -> float:
+def bench_masked(num_groups, expected_m_per_group, k, n, loads=None) -> float:
     [(kerneltype, max_m)] = enumerate_m_grouped_masked()
+    if loads is not None:
+        max_m = max(max_m, max(loads))
     a_fp8, b_fp8, masked_m, d, ref_d = generate_m_grouped_masked(
-        num_groups, max_m, expected_m_per_group, n, k
+        num_groups, max_m, expected_m_per_group, n, k, loads=loads
     )
     def test_func():
         deep_gemm.m_grouped_fp8_gemm_nt_masked(
@@ -223,10 +235,10 @@ def bench_masked(num_groups, expected_m_per_group, k, n) -> float:
         )
     return bench_kineto(test_func, "fp8_gemm", suppress_kineto_output=True)
 
-def bench_contiguous(num_groups, expected_m_per_group, k, n) -> float:
+def bench_contiguous(num_groups, expected_m_per_group, k, n, loads=None) -> float:
     [(kerneltype, major_a, major_b)] = enumerate_m_grouped_contiguous()
     m, a_fp8, b_fp8, m_indices, d, ref_d = generate_m_grouped_contiguous(
-        num_groups, expected_m_per_group, n, k, major_a, major_b
+        num_groups, expected_m_per_group, n, k, major_a, major_b, loads=loads
     )
     def test_func():
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
