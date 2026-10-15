@@ -3,6 +3,7 @@
     "Qwen3NextForCausalLM"
   ],
   "attention_dropout": 0.0,
+  "attn_output_gate": true,
   "bos_token_id": 151643,
   "decoder_sparse_step": 1,
   "eos_token_id": 151645,
