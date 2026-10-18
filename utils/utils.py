@@ -346,7 +346,8 @@ def get_compute_path(args):
     if not os.path.isdir(result_dir):
         os.makedirs(result_dir)
     phase = args.phase
-    filename = f"{args.model_name}-world_size{args.world_size}-tp{args.tensor_model_parallel_size}-pp1-ep{args.expert_model_parallel_size}-bpg{args.micro_batch}-seq{args.seq_length}-{phase}.txt"
+    ctx = f"-ctx{args.context_length}" if getattr(args, "context_length", 0) else ""
+    filename = f"{args.model_name}-world_size{args.world_size}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel}-ep{args.expert_model_parallel_size}-bpg{args.micro_batch}-seq{args.seq_length}{ctx}-{phase}.txt"
     filepath = os.path.join(result_dir, filename)
     return filepath
 

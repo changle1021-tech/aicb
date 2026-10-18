@@ -119,6 +119,13 @@ class VidurWorkload():
         elif phase == InferencePhase.PREFILL.value:
             m = self.args.seq_length
         tp_comm_size = 2 * m * self.args.hidden_size
+        if self.args.model_name == "Qwen3-Next-80B":
+            dp = self.args.world_size // self.tp // self.args.pipeline_model_parallel
+            # Native AG/RS communicates hidden states and router logits in BF16.
+            # It does not dispatch top-k FP8 token copies as DeepEP does.
+            dispatch = (dp - 1) * m * 2 * (self.args.hidden_size + self.args.num_experts)
+            combine = (dp - 1) * m * 2 * self.args.hidden_size
+            return tp_comm_size, dispatch, combine
         ep_combine_size = tp_comm_size * self.topk // self.tp
         ep_dispatch_size = ep_combine_size
 
@@ -158,6 +165,29 @@ class VidurWorkload():
         self.vidur_layers = [[layer_id, layer_type, comp_sum, comm_sum]
                 for (layer_id, layer_type), (comp_sum, comm_sum) in items]
         
+        if self.args.model_name == "Qwen3-Next-80B" and getattr(self.args,"moe_compute_profile",None):
+            from workload_generator.mocked_model.inference.qwen3_next_moe import load_critical_moe_profile
+            measured = load_critical_moe_profile(self.args)
+            # Native FusedMoE replay starts after router linear. AIOB retains
+            # that linear in moe_route only when the replay excludes it.
+            norm_ns = self.compute_cache["moe_norm"]
+            for row in self.vidur_layers:
+                if row[1].value == "moe":
+                    # The statistics parser omits exactly-zero entries. A
+                    # profile which includes router compute intentionally
+                    # produces no separate moe_route entry.
+                    row[2] = norm_ns + self.compute_cache.get("moe_route", 0) + measured[row[0]] * 1e6
+
+        if self.args.model_name == "Qwen3-Next-80B" and self.args.phase == "prefill":
+            # The compiled GDN chain already includes both decoder norms.
+            for row in self.vidur_layers:
+                is_gdn = (row[0]+1) % self.args.full_attention_interval != 0
+                if is_gdn:
+                    if row[1].value == "attention":
+                        row[2] -= self.compute_cache["attention_norm"]
+                    elif row[1].value == "moe":
+                        row[2] -= self.compute_cache["moe_norm"]
+
         # Comm part
         tp_comm_size, ep_dispatch_size, ep_combine_size = self.get_comm_size()
         tp_comm_size = tp_comm_size if self.tp > 1 else 0
@@ -190,6 +220,10 @@ if __name__ == "__main__":
     # Add arguments that has default value
     parser.add_argument("--aiob_enable", action="store_true", default=False, help="Enable AIOB")
     parser.add_argument("--aiob_forward_loops", type=int, default=1, help="Number of AIOB forward loops")
+    parser.add_argument("--profile_seed", type=int, default=42, help="Deterministic component profiling seed")
+    parser.add_argument("--moe_compute_profile", default=None, help="Measured real-route MoE critical-compute JSON")
+    parser.add_argument("--context_length", type=int, default=0, help="Existing KV tokens before a Qwen3-Next prefill chunk")
+    parser.add_argument("--block_size", type=int, default=None, help="Qwen3-Next KV block override; default derives hybrid state-page alignment")
     parser.add_argument("--projection_precision", choices=["bf16", "fp8"], default=None,
                         help="Qwen3-Next projection precision (default: model torch_dtype)")
     gate_options = parser.add_mutually_exclusive_group()
@@ -230,7 +264,8 @@ if __name__ == "__main__":
     result_dir = args.result_dir
     if not os.path.isdir(result_dir):
         os.makedirs(result_dir)
-    filename = f"vidur-{args.model_name}-world_size{args.world_size}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel}-ep{args.expert_model_parallel_size}-bs{args.micro_batch}-seq{args.seq_length}-{phase}"
+    ctx = f"-ctx{args.context_length}" if getattr(args, "context_length", 0) else ""
+    filename = f"vidur-{args.model_name}-world_size{args.world_size}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel}-ep{args.expert_model_parallel_size}-bs{args.micro_batch}-seq{args.seq_length}{ctx}-{phase}"
     
     if args.aiob_enable:
         if "Qwen3-Moe" in model_name:
@@ -251,7 +286,7 @@ if __name__ == "__main__":
 
     else:
         aiob_dir = "results/aiob_outputs"
-        aiob_output_filename = f"{args.model_name}-world_size{args.world_size}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel}-ep{args.expert_model_parallel_size}-bpg{args.micro_batch}-seq{args.seq_length}-{phase}.txt"
+        aiob_output_filename = f"{args.model_name}-world_size{args.world_size}-tp{args.tensor_model_parallel_size}-pp{args.pipeline_model_parallel}-ep{args.expert_model_parallel_size}-bpg{args.micro_batch}-seq{args.seq_length}{ctx}-{phase}.txt"
         aiob_output_filepath = os.path.join(aiob_dir,aiob_output_filename)
         if not os.path.exists(aiob_output_filepath):
             print(f"aiob not enabled, and {aiob_output_filepath} not found. Using default compute time.")

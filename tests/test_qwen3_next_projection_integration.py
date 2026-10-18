@@ -2,7 +2,7 @@
 
 import ast
 import copy
-from contextlib import nullcontext, redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 import io
 import json
 import math
@@ -34,7 +34,7 @@ def load_profiling_classes():
     # Keep the actual method bodies. Replace only GPU base classes/imports so
     # the production forward/parameter wiring can run on a CPU-only machine.
     nodes = []
-    names = ("Qwen3NextGatedDeltaNet", "Qwen3NextAttention", "Qwen3NextModel")
+    names = ("Qwen3NextGatedDeltaNet", "Qwen3NextAttention", "Qwen3NextModel", "Qwen3NextSparseMoeBlock")
     for node in ast.parse(AIOB.read_text()).body:
         if isinstance(node, ast.ClassDef) and node.name in names:
             node = copy.deepcopy(node)
@@ -43,8 +43,14 @@ def load_profiling_classes():
     env = {
         "InferencePhase": InferencePhase,
         "benchmark_projection": Mock(return_value=1.0),
+        "critical_profile_includes_router": Mock(return_value=True),
         "benchmark_input_quantization": Mock(return_value=0.0),
+        "benchmark_gdn_conv": Mock(return_value=100.0),
+        "benchmark_gdn_core": Mock(return_value=200.0),
+        "benchmark_gdn_gating": Mock(return_value=300.0),
         "benchmark_attention_output_gate": Mock(return_value=2.0),
+        "benchmark_gdn_native_core": Mock(return_value=7.0),
+        "benchmark_gdn_compiled_chain": Mock(return_value=13.0),
         "benchmark_kv_cache_save": Mock(return_value=0.0),
         "projection_precision": projections.projection_precision,
         "projection_shapes": projections.projection_shapes,
@@ -60,19 +66,102 @@ def load_profiling_classes():
 class ProjectionBackendTests(unittest.TestCase):
     def test_region_uses_device_events_and_flush_outside_timed_interval(self):
         order = []
+        capture = {"graph": None}
+        start, end = Mock(), Mock()
+        def record(name):
+            self.assertIsNone(capture["graph"], "CUDA events must be recorded outside graph capture")
+            order.append((name, None))
+        start.record.side_effect = lambda: record("start")
+        end.record.side_effect = lambda: record("end")
+        start.elapsed_time.side_effect = [102.0, 38.0, 42.0, 106.0, 110.0, 46.0]
+        torch = Mock()
+        torch.empty.return_value.zero_.side_effect = lambda: order.append(("flush", capture["graph"]))
+        graph, baseline = Mock(), Mock()
+        graph.replay.side_effect = lambda: order.append(("graph_replay", None))
+        baseline.replay.side_effect = lambda: order.append(("baseline_replay", None))
+        torch.cuda.CUDAGraph.side_effect = [graph, baseline]
+        torch.cuda.Event.side_effect = [start, end]
+        @contextmanager
+        def graph_capture(value):
+            self.assertIsNone(capture["graph"])
+            capture["graph"] = value
+            order.append(("capture_start", value))
+            try:
+                yield
+            finally:
+                order.append(("capture_end", value))
+                capture["graph"] = None
+        torch.cuda.graph.side_effect = graph_capture
+        callback = Mock(side_effect=lambda: order.append(("kernel", capture["graph"])))
+        with patch.dict(sys.modules, {"torch": torch}):
+            seconds = projections.benchmark_gpu_region(callback, warmup=1, samples=3)
+        first_event = order.index(("start", None))
+        graph_kernels = [i for i, item in enumerate(order) if item == ("kernel", graph)]
+        self.assertEqual(len(graph_kernels), 32)
+        self.assertEqual(len([item for item in order if item == ("flush", graph)]), 32)
+        self.assertEqual(len([item for item in order if item == ("flush", baseline)]), 32)
+        self.assertEqual([order[i - 1] for i in graph_kernels], [("flush", graph)] * 32)
+        self.assertEqual(order[:first_event].count(("kernel", None)), 1)
+        self.assertEqual(callback.call_count, 33)
+        self.assertEqual(order[first_event:].count(("graph_replay", None)), 3)
+        self.assertEqual(order[first_event:].count(("baseline_replay", None)), 3)
+        self.assertEqual(start.record.call_count, 6)
+        self.assertEqual(end.record.call_count, 6)
+        self.assertEqual([(total-base)/32.0 for total, base in
+                          zip((102, 106, 110), (38, 42, 46))], [2.0, 2.0, 2.0])
+        self.assertEqual(seconds, 0.002)
+        self.assertEqual(torch.cuda.CUDAGraph.call_count, 2)
+
+    def test_eager_region_calls_callback_each_sample_and_flushes_before_start(self):
+        order = []
         start, end = Mock(), Mock()
         start.record.side_effect = lambda: order.append("start")
         end.record.side_effect = lambda: order.append("end")
-        start.elapsed_time.side_effect = [2.0, 1.0, 3.0]
+        end.synchronize.side_effect = lambda: order.append("end_sync")
+        start.elapsed_time.side_effect = [1.0, 3.0]
         torch = Mock()
+        torch.cuda.synchronize.side_effect = lambda: order.append("sync")
         torch.empty.return_value.zero_.side_effect = lambda: order.append("flush")
         torch.cuda.Event.side_effect = [start, end]
-        torch.cuda.graph.return_value = nullcontext()
+
+        def callback():
+            order.append("callback")
+
         with patch.dict(sys.modules, {"torch": torch}):
-            seconds = projections.benchmark_gpu_region(lambda: order.append("kernel"), warmup=1, samples=3)
-        self.assertEqual(order, ["kernel", "flush", "start", "kernel", "end"])
+            seconds = projections.benchmark_gpu_region(
+                callback, warmup=1, samples=2, timing_mode="eager"
+            )
+
+        self.assertEqual(order, [
+            "callback", "sync",
+            "flush", "sync", "start", "callback", "end", "end_sync",
+            "flush", "sync", "start", "callback", "end", "end_sync",
+        ])
         self.assertEqual(seconds, 0.002)
-        self.assertEqual(torch.cuda.CUDAGraph.return_value.replay.call_count, 3)
+        torch.cuda.CUDAGraph.return_value.replay.assert_not_called()
+        torch.cuda.graph.assert_not_called()
+
+    def test_component_dispatches_timing_mode_by_phase(self):
+        callback = Mock()
+        with patch.object(projections, "benchmark_gpu_region", return_value=0.25) as timer:
+            self.assertEqual(projections.benchmark_component(config(phase="prefill"), callback), 0.25)
+            timer.assert_called_once_with(callback, timing_mode="eager")
+
+            timer.reset_mock()
+            self.assertEqual(projections.benchmark_component(config(phase="decode"), callback), 0.25)
+            timer.assert_called_once_with(callback, timing_mode="cuda_graph")
+
+            timer.reset_mock()
+            self.assertEqual(projections.benchmark_component(SimpleNamespace(), callback), 0.25)
+            timer.assert_called_once_with(callback, timing_mode="cuda_graph")
+
+    def test_region_rejects_unknown_timing_mode(self):
+        torch = Mock()
+        with patch.dict(sys.modules, {"torch": torch}):
+            with self.assertRaisesRegex(ValueError, "timing_mode must be cuda_graph or eager"):
+                projections.benchmark_gpu_region(Mock(), timing_mode="invalid")
+        torch.cuda.synchronize.assert_not_called()
+        torch.empty.assert_not_called()
 
     def test_bf16_runs_linear_with_correct_weight_orientation(self):
         torch = Mock()
@@ -80,7 +169,7 @@ class ProjectionBackendTests(unittest.TestCase):
         x, weight = object(), object()
         torch.randn.side_effect = [x, weight]
         with patch.dict(sys.modules, {"torch": torch}), patch.object(
-            projections, "benchmark_gpu_region", side_effect=lambda fn: (fn(), 0.001)[1]
+            projections, "benchmark_gpu_region", side_effect=lambda fn, **kwargs: (fn(), 0.001)[1]
         ):
             self.assertEqual(projections.benchmark_projection(config(), 512, 2048, 12288), 0.001)
         self.assertEqual(torch.randn.call_args_list[0].args, (512, 2048))
@@ -99,7 +188,7 @@ class ProjectionBackendTests(unittest.TestCase):
         )
         torch = Mock()
         with patch.dict(sys.modules, {"torch": torch, "utils.deepgemm_utils": backend}), patch.object(
-            projections, "benchmark_gpu_region", side_effect=lambda fn: (fn(), 0.002)[1]
+            projections, "benchmark_gpu_region", side_effect=lambda fn, **kwargs: (fn(), 0.002)[1]
         ):
             value = projections.benchmark_projection(config(projection_precision="fp8"), 1, 4096, 2048)
         self.assertEqual(value, 0.002)
@@ -129,7 +218,7 @@ class ProjectionBackendTests(unittest.TestCase):
         torch.sigmoid.side_effect = lambda x: Tensor([1 / (1 + math.exp(-v)) for v in x.values])
         measured = []
         with patch.dict(sys.modules, {"torch": torch}), patch.object(
-            projections, "benchmark_gpu_region", side_effect=lambda fn: (measured.append(fn()), 0.003)[1]
+            projections, "benchmark_gpu_region", side_effect=lambda fn, **kwargs: (measured.append(fn()), 0.003)[1]
         ):
             projections.benchmark_attention_output_gate(config(), 1, 4096)
         self.assertAlmostEqual(measured[0].values[0], 1.0)
@@ -140,6 +229,22 @@ class ProjectionBackendTests(unittest.TestCase):
 
 
 class ProjectionWiringTests(unittest.TestCase):
+    def test_moe_profile_keeps_external_router_only_when_excluded_from_profile(self):
+        for included in (False, True):
+            with self.subTest(router_in_profile=included):
+                env = load_profiling_classes()
+                env["critical_profile_includes_router"].return_value = included
+                cls = env["Qwen3NextSparseMoeBlock"]
+                obj = cls.__new__(cls)
+                obj.args = config(moe_compute_profile="profile.json")
+                obj._route_gate = Mock(return_value=0.003)
+                expected = 0.0 if included else 0.003
+                self.assertEqual(obj.forward(), (expected, 0.0, 0.0, 0.0))
+                if included:
+                    obj._route_gate.assert_not_called()
+                else:
+                    obj._route_gate.assert_called_once_with(512)
+
     def test_gdn_forward_profiles_both_phases_and_uses_value_width(self):
         for tp in (1, 2, 4):
             for phase, m in (("prefill", 512), ("decode", 2)):
@@ -151,17 +256,31 @@ class ProjectionWiringTests(unittest.TestCase):
                                       linear_num_value_heads=64)
                     obj.tp = tp
                     obj.shapes = projections.projection_shapes(obj.args)
-                    for name in ("_causal_conv", "_fused_gdn_gating", "_fused_gdn_core", "_norm"):
+                    for name in ("_norm",):
                         setattr(obj, name, Mock(return_value=0))
-                    obj.forward()
+                    values = obj.forward()
                     calls = env["benchmark_projection"].call_args_list
-                    self.assertEqual([c.args[1:] for c in calls], [
-                        (m, 2048, 20480 // tp),
-                        (m, 2048, 128 // tp),
-                        (m, 8192 // tp, 2048),
-                    ])
-                    self.assertEqual([c.args[1:] for c in env["benchmark_input_quantization"].call_args_list],
-                                     [(m, 2048), (m, 8192 // tp)])
+                    if phase == "prefill":
+                        env["benchmark_gdn_compiled_chain"].assert_called_once_with(obj.args, m)
+                        self.assertEqual(values, (0.0, 0.0, 13.0, 0.0))
+                        self.assertEqual(calls, [])
+                        env["benchmark_input_quantization"].assert_not_called()
+                        env["benchmark_gdn_native_core"].assert_not_called()
+                    else:
+                        env["benchmark_gdn_compiled_chain"].assert_not_called()
+                        self.assertEqual([c.args[1:] for c in calls], [
+                            (m, 2048, 20480 // tp),
+                            (m, 2048, 128 // tp),
+                            (m, 8192 // tp, 2048),
+                        ])
+                        self.assertEqual([c.args[1:] for c in env["benchmark_input_quantization"].call_args_list],
+                                         [(m, 2048), (m, 8192 // tp)])
+                        env["benchmark_gdn_native_core"].assert_called_once_with(obj.args, phase, m)
+                    env["benchmark_gdn_conv"].assert_not_called()
+                    env["benchmark_gdn_core"].assert_not_called()
+                    env["benchmark_gdn_gating"].assert_not_called()
+                    self.assertEqual(values[1], 0.0)
+                    self.assertEqual(values[2], 13.0 if phase == "prefill" else 7.0)
 
     def test_attention_forward_keeps_gate_separate_and_kv_replication(self):
         env = load_profiling_classes()

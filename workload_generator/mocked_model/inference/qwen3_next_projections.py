@@ -11,7 +11,7 @@ from pathlib import Path
 from statistics import median
 
 
-PROJECTION_PROFILE_VERSION = 2
+PROJECTION_PROFILE_VERSION = 3
 CACHE_FLUSH_BYTES = 128 * 1024 * 1024
 
 
@@ -90,8 +90,8 @@ def projection_precision(args):
     raise ValueError("Qwen3-Next projections support bf16 or fp8, got {!r}".format(value))
 
 
-def benchmark_gpu_region(fn, warmup=5, samples=30):
-    """Return seconds for one device region, excluding Python launch gaps.
+def benchmark_gpu_region(fn, warmup=5, samples=30, timing_mode="cuda_graph"):
+    """Return seconds for one cold-cache callback in the selected execution mode.
 
     Capture the entire callback so multi-kernel linear implementations and both
     sigmoid/multiply operations are included. Compilation and allocation of
@@ -101,24 +101,65 @@ def benchmark_gpu_region(fn, warmup=5, samples=30):
 
     if warmup < 1 or samples < 1:
         raise ValueError("warmup and samples must be positive")
+    if timing_mode not in ("cuda_graph", "eager"):
+        raise ValueError("timing_mode must be cuda_graph or eager")
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     flush = torch.empty(CACHE_FLUSH_BYTES, device="cuda", dtype=torch.uint8)
-    start = torch.cuda.Event(enable_timing=True, external=True)
-    end = torch.cuda.Event(enable_timing=True, external=True)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    if timing_mode == "eager":
+        # vLLM's prefill custom ops run on the host for every invocation.
+        # A Graph replay removes that launch work and its GPU idle gaps.
+        timings = []
+        for _ in range(samples):
+            flush.zero_()
+            torch.cuda.synchronize()
+            start.record()
+            fn()
+            end.record()
+            end.synchronize()
+            timings.append(start.elapsed_time(end))
+        return median(timings) / 1000.0
+    # Event nodes captured inside a graph add several microseconds even to
+    # an empty callback. Time outside replay and amortize launch/event cost.
+    # Flush before *each* invocation so repeated weights do not stay in L2.
+    repeats = 32
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        flush.zero_()
+        for _ in range(repeats):
+            flush.zero_()
+            fn()
+    baseline = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(baseline):
+        for _ in range(repeats):
+            flush.zero_()
+    def elapsed(g):
         start.record()
-        fn()
+        g.replay()
         end.record()
+        end.synchronize()
+        return start.elapsed_time(end)
     timings = []
-    for _ in range(samples):
-        graph.replay()
-        torch.cuda.synchronize()
-        timings.append(start.elapsed_time(end))
-    return median(timings) / 1000.0
+    for i in range(samples):
+        # Alternate order to reduce drift in clocks and temperature.
+        if i % 2:
+            base = elapsed(baseline)
+            total = elapsed(graph)
+        else:
+            total = elapsed(graph)
+            base = elapsed(baseline)
+        timings.append((total - base) / repeats)
+    seconds = median(timings) / 1000.0
+    if seconds <= 0:
+        raise ValueError("GPU region is below the cold Graph timing resolution")
+    return seconds
+
+
+def benchmark_component(args, fn):
+    mode = "eager" if getattr(args, "phase", "decode") == "prefill" else "cuda_graph"
+    return benchmark_gpu_region(fn, timing_mode=mode)
 
 
 def benchmark_projection(args, m, k, n):
@@ -128,7 +169,7 @@ def benchmark_projection(args, m, k, n):
     if precision == "bf16":
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
         weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-        return benchmark_gpu_region(lambda: torch.nn.functional.linear(x, weight))
+        return benchmark_component(args, lambda: torch.nn.functional.linear(x, weight))
 
     from utils.deepgemm_utils import construct, deep_gemm, calc_diff
 
@@ -143,7 +184,7 @@ def benchmark_projection(args, m, k, n):
     diff = calc_diff(out, reference)
     if not diff < 0.001:
         raise ValueError("FP8 projection check failed for M/K/N={}/{}/{}: {}".format(m, k, n, diff))
-    return benchmark_gpu_region(run)
+    return benchmark_component(args, run)
 
 
 def benchmark_input_quantization(args, m, width):
@@ -153,7 +194,7 @@ def benchmark_input_quantization(args, m, width):
     from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
 
     x = torch.randn(m, width, device="cuda", dtype=torch.bfloat16)
-    return benchmark_gpu_region(
+    return benchmark_component(args,
         lambda: per_token_group_quant_fp8(x, 128, column_major_scales=True)
     )
 
@@ -165,25 +206,34 @@ def benchmark_attention_output_gate(args, m, width):
 
     output = torch.randn(m, width, device="cuda", dtype=torch.bfloat16)
     gate = torch.randn_like(output)
-    return benchmark_gpu_region(lambda: output * torch.sigmoid(gate))
+    return benchmark_component(args, lambda: output * torch.sigmoid(gate))
 
 
 def projection_metadata(args):
     """Identity of these projection components, not of all MoE compute."""
-    sources = [Path(__file__), Path(__file__).with_name("AiobQwen3Next.py")]
+    sources = [Path(__file__).with_name(name) for name in (
+        "qwen3_next_projections.py", "AiobQwen3Next.py",
+        "qwen3_next_attention.py", "qwen3_next_moe.py",
+    )]
     source_hash = hashlib.sha256(b"".join(p.read_bytes() for p in sources)).hexdigest()
     return {
         "projection_profile_version": PROJECTION_PROFILE_VERSION,
-        "scope": "qwen3_next_projections_only",
+        "scope": "qwen3_next_components",
+        "gdn_time_scope": ("compiled_chain_with_input_and_post_norm" if getattr(args,"phase",None)=="prefill" else "components"),
+        "moe_time_scope": (json.loads(Path(args.moe_compute_profile).read_text()).get("time_scope_by_phase",{}).get(args.phase,"compute_only")
+                           if getattr(args,"moe_compute_profile",None) else "compute_only"),
+        "moe_compute_profile_sha256": (hashlib.sha256(Path(args.moe_compute_profile).read_bytes()).hexdigest()
+                                        if getattr(args,"moe_compute_profile",None) else None),
         "precision": projection_precision(args),
-        "timing_scope": "cuda_graph_device_region_seconds",
+        "timing_scope": "eager_stream_region_seconds" if getattr(args, "phase", "decode") == "prefill" else "cuda_graph_device_region_seconds",
         "cache_flush_bytes": CACHE_FLUSH_BYTES,
         "source_sha256": source_hash,
         "shapes": asdict(projection_shapes(args)),
         "invocation": {name: getattr(args, name, None) for name in (
             "model_name", "world_size", "tensor_model_parallel_size",
             "pipeline_model_parallel", "expert_model_parallel_size",
-            "micro_batch", "seq_length", "phase",
+            "micro_batch", "seq_length", "phase", "context_length",
+            "profile_seed", "block_size",
         )},
     }
 

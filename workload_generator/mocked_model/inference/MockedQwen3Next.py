@@ -76,7 +76,7 @@ class Qwen3NextParams(MockedParamsBase):
 
         # These projection options are specific to Qwen3-Next. An omitted CLI
         # option must not override a value loaded from the model config.
-        for name in ("projection_precision", "attn_output_gate"):
+        for name in ("projection_precision", "attn_output_gate", "profile_seed", "context_length", "block_size", "moe_compute_profile"):
             value = getattr(args, name, None)
             if value is not None:
                 setattr(self, name, value)

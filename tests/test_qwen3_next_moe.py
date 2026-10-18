@@ -1,10 +1,14 @@
 """CPU tests for the Qwen3-Next MoE load and layout contracts."""
 
 import random
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
 from workload_generator.mocked_model.inference.qwen3_next_moe import (
+    critical_profile_includes_router,
     expected_local_routes,
     gathered_tokens,
     moe_parallel_layout,
@@ -55,6 +59,20 @@ class ExpertLoadTests(unittest.TestCase):
                 sample_expert_loads(bad, 4)
 
 
+class ProfileScopeTests(unittest.TestCase):
+    def test_router_inclusion_follows_profile_scope_and_requires_boolean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            cfg = SimpleNamespace(moe_compute_profile=str(path), phase="prefill")
+            for scope, included in (("compute_only", True), ("compute_and_ep_comm", False)):
+                path.write_text(json.dumps({"time_scope_by_phase": {"prefill": scope}}))
+                self.assertEqual(critical_profile_includes_router(cfg), included)
+            path.write_text(json.dumps({"time_scope_by_phase": {"prefill": "compute_and_ep_comm"},
+                                        "router_linear_included_by_phase": {"prefill": "false"}}))
+            with self.assertRaisesRegex(ValueError, "boolean"):
+                critical_profile_includes_router(cfg)
+
+
 class SharedExpertWiringTests(unittest.TestCase):
     def test_moe_forward_returns_shared_expert_time(self):
         import ast
@@ -66,7 +84,9 @@ class SharedExpertWiringTests(unittest.TestCase):
         moe = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                    and n.name == "Qwen3NextSparseMoeBlock")
         forward = next(n for n in moe.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
-        self.assertIn("benchmark_shared_expert", ast.unparse(forward))
+        called = [n.func.id for n in ast.walk(forward)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+        self.assertIn("benchmark_shared_expert", called)
 
     def test_shared_expert_defaults_to_moe_intermediate_size(self):
         from workload_generator.mocked_model.inference.qwen3_next_moe import benchmark_shared_expert
