@@ -71,7 +71,31 @@ def sample_routing(num_tokens, num_experts, topk, generator=None):
     return scores.topk(topk, dim=1).indices.to(torch.int32)
 
 
-def benchmark_routed_experts(args, local_tokens):
+def validate_routed_replay(args, local_tokens, inputs):
+    """Check a replay's tensor shapes without importing CUDA dependencies.
+
+    The expert map is supplied by the serving rank, rather than reconstructed
+    as rank zero. Local rows include runtime padding; callers must not replace
+    them with the number of live requests.
+    """
+    dp, ep, local_experts = moe_parallel_layout(args)
+    tokens = gathered_tokens(local_tokens, dp)
+    hidden = _positive_int("hidden_size", args.hidden_size)
+    inter = _positive_int("moe_intermediate_size", args.moe_intermediate_size)
+    topk = _positive_int("num_experts_per_tok", args.num_experts_per_tok)
+    shapes = dict(hidden_states=(tokens, hidden),
+                  w1=(local_experts, 2 * inter, hidden),
+                  w2=(local_experts, hidden, inter),
+                  topk_ids=(tokens, topk), topk_weights=(tokens, topk),
+                  expert_map=(args.num_experts,))
+    for name, expected in shapes.items():
+        if name not in inputs or tuple(inputs[name].shape) != expected:
+            raise ValueError("{} replay shape must be {}".format(name, expected))
+    return inputs
+
+
+def benchmark_routed_experts(args, local_tokens, *, replay_inputs=None,
+                             cache_policy="cold", timing_details=None):
     """Device time of routed-expert Gate/Up, SiluAndMul and Down on one EP rank."""
     import torch
 
@@ -83,23 +107,48 @@ def benchmark_routed_experts(args, local_tokens):
     num_experts = args.num_experts
 
     if projection_precision(args) == "fp8":
+        if (replay_inputs is not None or cache_policy != "cold"
+                or timing_details is not None):
+            raise ValueError("Replay/cache timing controls require the BF16 routed-expert backend")
         return _benchmark_routed_experts_fp8(args, local_tokens, dp, ep, local_experts)
 
-    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        disable_inplace, fused_experts,
+    )
 
-    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
-    w1 = torch.randn(local_experts, 2 * inter, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
-    w2 = torch.randn(local_experts, hidden, inter, device="cuda", dtype=torch.bfloat16) * 0.02
-    topk_ids = sample_routing(tokens, num_experts, topk)
-    topk_weights = torch.full((tokens, topk), 1.0 / topk, device="cuda", dtype=torch.float32)
-    expert_map = torch.full((num_experts,), -1, device="cuda", dtype=torch.int32)
-    expert_map[:local_experts] = torch.arange(local_experts, device="cuda", dtype=torch.int32)
+    if replay_inputs is None:
+        x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        w1 = torch.randn(local_experts, 2 * inter, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+        w2 = torch.randn(local_experts, hidden, inter, device="cuda", dtype=torch.bfloat16) * 0.02
+        topk_ids = sample_routing(tokens, num_experts, topk)
+        topk_weights = torch.full((tokens, topk), 1.0 / topk, device="cuda", dtype=torch.float32)
+        expert_map = torch.full((num_experts,), -1, device="cuda", dtype=torch.int32)
+        expert_map[:local_experts] = torch.arange(local_experts, device="cuda", dtype=torch.int32)
+    else:
+        data = validate_routed_replay(args, local_tokens, replay_inputs)
+        x, w1, w2 = (data[n] for n in ("hidden_states", "w1", "w2"))
+        topk_ids, topk_weights, expert_map = (
+            data[n] for n in ("topk_ids", "topk_weights", "expert_map"))
+
+    # Match the serving call AND its runtime dispatch: vLLM disables inplace
+    # on torch >= 2.9. Do not introduce an input-copy/cache change in that case.
+    # On runtimes that do use inplace, restore a private working tensor outside
+    # the timed region so replay never feeds back the previous output.
+    prepare = None
+    if not disable_inplace():
+        reference = x
+        x = reference.clone()
+
+        def prepare():
+            x.copy_(reference)
 
     def run():
         fused_experts(x, w1, w2, topk_weights, topk_ids,
-                      global_num_experts=num_experts, expert_map=expert_map)
+                      inplace=True, global_num_experts=num_experts,
+                      expert_map=expert_map)
 
-    return benchmark_gpu_region(run)
+    return benchmark_gpu_region(run, cache_policy=cache_policy,
+                                timing_details=timing_details, prepare=prepare)
 
 
 def _benchmark_routed_experts_fp8(args, local_tokens, dp, ep, local_experts):

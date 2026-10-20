@@ -127,10 +127,10 @@ class Qwen3NextGatedDeltaNet(torch.nn.Module):
     def _fused_gdn_gating(self, m):
         A_log = torch.empty(
                 divide(self.args.linear_num_value_heads, self.tp),
-                dtype=torch.float32,
+                dtype=torch.float32, device='cuda',
             )
         a = torch.randn(m, self.args.linear_num_value_heads//self.tp, device='cuda', dtype=torch.bfloat16)
-        dt_bias = torch.ones(self.args.linear_num_value_heads // self.tp)
+        dt_bias = torch.ones(self.args.linear_num_value_heads // self.tp, device='cuda')
 
         batch, num_heads = a.shape
         seq_len=1
@@ -390,9 +390,10 @@ class Qwen3NextSparseMoeBlock(torch.nn.Module):
         elif phase == InferencePhase.PREFILL.value:
             local_tokens = self.args.seq_length
 
-        # vLLM AG/RS EP: router and top-k run after the DP all-gather.
+        # vLLM computes gate logits on local hidden states, then dispatches
+        # hidden states/logits before top-k and routed-expert execution.
         tokens = gathered_tokens(local_tokens, self.dp)
-        route_gate = self._route_gate(tokens)
+        route_gate = self._route_gate(local_tokens)
         route_select_experts = self._select_experts(tokens)
         routed_experts = benchmark_routed_experts(self.args, local_tokens)
         shared_expert = benchmark_shared_expert(self.args, local_tokens)

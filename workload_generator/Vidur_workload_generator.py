@@ -12,6 +12,9 @@ from utils.utils import CommType, get_params, get_comp_out, extract_inference_av
 from workload_generator.mocked_model.inference.qwen3_next_projections import (
     validate_projection_metadata, write_projection_metadata,
 )
+from workload_generator.mocked_model.inference.qwen3_next_moe_timing import (
+    compose_qwen_moe_cache, write_composition_metadata,
+)
 import os
 from typing import List, Tuple
 from collections import deque
@@ -192,6 +195,8 @@ if __name__ == "__main__":
     parser.add_argument("--aiob_forward_loops", type=int, default=1, help="Number of AIOB forward loops")
     parser.add_argument("--projection_precision", choices=["bf16", "fp8"], default=None,
                         help="Qwen3-Next projection precision (default: model torch_dtype)")
+    parser.add_argument("--moe_shared_overlap", choices=["auto", "serial"], default="auto",
+                        help="Compose Qwen BF16 shared overlap for the verified vLLM 0.11.2 path; serial is an ablation")
     gate_options = parser.add_mutually_exclusive_group()
     gate_options.add_argument("--attn_output_gate", dest="attn_output_gate", action="store_true")
     gate_options.add_argument("--no_attn_output_gate", dest="attn_output_gate", action="store_false")
@@ -217,7 +222,9 @@ if __name__ == "__main__":
         args = MockedQwen3Moe.Qwen3MoeParams(config_file, args)
         model = MockedQwen3Moe.Qwen3MoeModel(args)
     elif "Qwen3-Next" in model_name:
+        moe_shared_overlap_mode = args.moe_shared_overlap
         args = MockedQwen3Next.Qwen3NextParams(config_file, args)
+        args.moe_shared_overlap = moe_shared_overlap_mode
         model = MockedQwen3Next.Qwen3NextModel(args)
     elif "DeepSeek" in model_name:
         args = MockedDeepSeek.DeepSeekParams(config_file, args)
@@ -261,6 +268,10 @@ if __name__ == "__main__":
     if "Qwen3-Next" in model_name:
         validate_projection_metadata(aiob_output_filepath, args)
     compute_cache = extract_inference_averages(aiob_output_filepath,args)
+    moe_composition = None
+    if "Qwen3-Next" in model_name:
+        compute_cache, moe_composition = compose_qwen_moe_cache(
+            compute_cache, aiob_output_filepath, args)
     print("compute_cache = {")
     for key, value in compute_cache.items():
         print(f"    '{key}' : {value},")
@@ -274,6 +285,8 @@ if __name__ == "__main__":
     work.dump_file(filepath)
     if "Qwen3-Next" in model_name:
         write_projection_metadata(filepath + ".csv", args)
+        write_composition_metadata(filepath + ".csv", aiob_output_filepath,
+                                   moe_composition)
     print("workload save in :", filepath)
     print("Finish Model initialization")
     

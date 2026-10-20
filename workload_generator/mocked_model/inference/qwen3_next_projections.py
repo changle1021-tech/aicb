@@ -90,26 +90,38 @@ def projection_precision(args):
     raise ValueError("Qwen3-Next projections support bf16 or fp8, got {!r}".format(value))
 
 
-def benchmark_gpu_region(fn, warmup=5, samples=30):
+def benchmark_gpu_region(fn, warmup=5, samples=30, *, cache_policy="cold",
+                         timing_details=None, prepare=None):
     """Return seconds for one device region, excluding Python launch gaps.
 
     Capture the entire callback so multi-kernel linear implementations and both
     sigmoid/multiply operations are included. Compilation and allocation of
     inputs belong outside this helper. This is not model-forward wall time.
+    ``prepare`` restores mutable inputs before every execution and is outside
+    the timed events. Cold remains the default; warm is an explicit diagnostic
+    control, rather than a fitted change to the production cache assumption.
     """
     import torch
 
+    if cache_policy not in ("cold", "warm"):
+        raise ValueError("cache_policy must be 'cold' or 'warm'")
     if warmup < 1 or samples < 1:
         raise ValueError("warmup and samples must be positive")
     for _ in range(warmup):
+        if prepare is not None:
+            prepare()
         fn()
     torch.cuda.synchronize()
-    flush = torch.empty(CACHE_FLUSH_BYTES, device="cuda", dtype=torch.uint8)
+    flush = (torch.empty(CACHE_FLUSH_BYTES, device="cuda", dtype=torch.uint8)
+             if cache_policy == "cold" else None)
     start = torch.cuda.Event(enable_timing=True, external=True)
     end = torch.cuda.Event(enable_timing=True, external=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        flush.zero_()
+        if flush is not None:
+            flush.zero_()
+        if prepare is not None:
+            prepare()
         start.record()
         fn()
         end.record()
@@ -118,7 +130,13 @@ def benchmark_gpu_region(fn, warmup=5, samples=30):
         graph.replay()
         torch.cuda.synchronize()
         timings.append(start.elapsed_time(end))
-    return median(timings) / 1000.0
+    seconds = median(timings) / 1000.0
+    if timing_details is not None:
+        timing_details.update(cache_policy=cache_policy,
+                              metric="cuda_event_region_span_ms",
+                              samples_ms=timings, median_ms=seconds * 1000.0,
+                              flush_bytes=CACHE_FLUSH_BYTES if flush is not None else 0)
+    return seconds
 
 
 def benchmark_projection(args, m, k, n):
@@ -168,9 +186,22 @@ def benchmark_attention_output_gate(args, m, width):
     return benchmark_gpu_region(lambda: output * torch.sigmoid(gate))
 
 
+def profile_runtime_versions():
+    """Read producer dependency versions without importing CUDA libraries."""
+    from importlib import metadata
+    versions = {}
+    for distribution in ("torch", "vllm"):
+        try:
+            versions[distribution] = metadata.version(distribution)
+        except metadata.PackageNotFoundError:
+            versions[distribution] = None
+    return versions
+
+
 def projection_metadata(args):
-    """Identity of these projection components, not of all MoE compute."""
-    sources = [Path(__file__), Path(__file__).with_name("AiobQwen3Next.py")]
+    """Projection contract plus producer identity for the complete profile file."""
+    sources = [Path(__file__), Path(__file__).with_name("AiobQwen3Next.py"),
+               Path(__file__).with_name("qwen3_next_moe.py")]
     source_hash = hashlib.sha256(b"".join(p.read_bytes() for p in sources)).hexdigest()
     return {
         "projection_profile_version": PROJECTION_PROFILE_VERSION,
@@ -179,6 +210,7 @@ def projection_metadata(args):
         "timing_scope": "cuda_graph_device_region_seconds",
         "cache_flush_bytes": CACHE_FLUSH_BYTES,
         "source_sha256": source_hash,
+        "runtime_versions": profile_runtime_versions(),
         "shapes": asdict(projection_shapes(args)),
         "invocation": {name: getattr(args, name, None) for name in (
             "model_name", "world_size", "tensor_model_parallel_size",
